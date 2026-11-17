@@ -85,7 +85,9 @@ Pull requests are welcome. Before opening one, run the suite — it must pass:
 node test/run-all.mjs
 ```
 
-Because the parsing layer is built against real vendor files, a PR that changes a parser should either add a fixture or explain why the existing fixture already covers it. A CI workflow is included at `.github/workflows/tests.yml` and runs on every push and PR once it is enabled on the repository.
+Because the parsing layer is built against real vendor files, a PR that changes a parser should either add a fixture or explain why the existing fixture already covers it.
+
+CI is provided but not yet enabled on this repository. To turn it on, copy [`ci/tests.yml`](ci/tests.yml) to `.github/workflows/tests.yml` (needs a token with the `workflow` scope, or the GitHub web UI) and it will run the suite on Node 20/22 on Linux and Windows for every push and PR.
 
 ## Credit
 
