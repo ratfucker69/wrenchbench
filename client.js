@@ -1256,6 +1256,60 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Render guard for the whole panel.
+     *
+     * A single render-time exception used to blank the pane with no clue why —
+     * a real one was a useCallback whose dependency array read a const declared
+     * further down. Failing loudly is worth more than failing silently: this
+     * shows the message, says the board data is untouched, and points at the
+     * repository, so the fault can be reported instead of guessed at.
+     */
+    class PanelBoundary extends React.Component {
+      constructor(props) {
+        super(props)
+        this.state = { error: null }
+      }
+
+      static getDerivedStateFromError(error) {
+        return { error }
+      }
+
+      componentDidCatch(error, info) {
+        console.error('[wrenchbench] panel render failed', error, info)
+      }
+
+      render() {
+        const { error } = this.state
+        if (!error) return this.props.children
+        const message = error && error.message ? error.message : String(error)
+        return React.createElement(
+          'div',
+          {
+            style: {
+              padding: '18px 20px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+              fontSize: 12.5,
+              lineHeight: 1.5,
+            },
+          },
+          React.createElement('div', { style: { fontSize: 15, fontWeight: 650 } }, 'WrenchBench could not draw the panel'),
+          React.createElement(
+            'div',
+            { style: { fontFamily: 'ui-monospace, Menlo, Consolas, monospace', fontSize: 11.5, color: 'inherit' } },
+            message,
+          ),
+          React.createElement(
+            'div',
+            { style: { opacity: 0.7 } },
+            'Your board library is untouched — this is a display fault, not lost data. Reloading the page retries; the same message twice is a bug worth reporting at github.com/ratfucker69/wrenchbench/issues with this text.',
+          ),
+        )
+      }
+    }
+
     function WrenchBenchPanel() {
           const [index, setIndex] = React.useState(null)
           const [indexError, setIndexError] = React.useState('')
@@ -2004,16 +2058,6 @@ window.__ModuleLoader__.load({
             [hitTest],
           )
 
-          /** Select a part and bring it into view — the inspector/wizard path. */
-          const focusRefdes = React.useCallback(
-            (refdes) => {
-              if (!refdes) return
-              setSelection({ refdes, net: null, pin: null, annotation: null })
-              zoomToPart(refdes)
-            },
-            [zoomToPart],
-          )
-
           const zoomToPart = React.useCallback((refdes) => {
             const canvas = canvasRef.current
             const current = docRef.current
@@ -2041,6 +2085,16 @@ window.__ModuleLoader__.load({
             })
             setSelection({ refdes: part.refdes, net: null, pin: null, annotation: null })
           }, [])
+
+          /** Select a part and bring it into view — the inspector/wizard path. */
+          const focusRefdes = React.useCallback(
+            (refdes) => {
+              if (!refdes) return
+              setSelection({ refdes, net: null, pin: null, annotation: null })
+              zoomToPart(refdes)
+            },
+            [zoomToPart],
+          )
 
           // --- keyboard -------------------------------------------------------
           React.useEffect(() => {
@@ -4109,7 +4163,14 @@ window.__ModuleLoader__.load({
             Icon,
           ),
         )
-        ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'wrenchbench' }, WrenchBenchPanel))
+        ctx.slots.inject('main', () =>
+          ctx.slots.register(
+            { name: 'main', key: 'wrenchbench' },
+            // Rendered through the boundary so a throw shows a message instead
+            // of an empty pane.
+            (props) => h(PanelBoundary, props, h(WrenchBenchPanel, props)),
+          ),
+        )
       },
     }
   },
