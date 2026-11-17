@@ -22,6 +22,7 @@ import { pagesForToken, searchSchematic } from './pdf-text.js'
 import { extractSchematic } from './schematic.js'
 import { assignComponentRails, classifyRails, deriveRailAliases, voltageOf } from './rails.js'
 import { classifyParts, displayRefdes, isPlaceholderRefdes, planNaming } from './naming.js'
+import { resolveQuery } from './resolve.js'
 import { nextChecks } from './diagnose.js'
 import * as store from './store.js'
 
@@ -741,6 +742,86 @@ function buildTools(ctx, config) {
   })
 
   tools.push({
+    name: 'wrenchbench_find',
+    description:
+      'Resolve a plain-language description of a part or a rail to real candidates on this board. Use this whenever the technician describes something instead of naming it — "the big chip near the CPU", "the coil by the VRM", "the 3V3 rail", "the HDMI transmitter", "shorted cap" — and before naming any component yourself. Returns ranked candidates, each with the reason it matched, plus a warning when nothing matches. It never invents a part: confirm with the technician, then point at it with wrenchbench_focus.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description:
+            'The description in the technician\'s own words, e.g. "the big chip near U12", "3V3 supply", "coils", "the HDMI chip"',
+        },
+        limit: { type: 'integer', description: 'Candidates per kind (default 6, max 20)' },
+        board: { type: 'string', description: 'Board id or name. Defaults to the board on the canvas.' },
+      },
+      required: ['query'],
+    },
+    output: { schema: TOOL_OUTPUT_SCHEMA, render: renderToolOutput },
+    execute: (args) => {
+      const loaded = loadBoard(args?.board)
+      if (loaded.error) return { text: loaded.error, isError: true }
+      const { board, meta } = loaded
+      const query = String(args?.query ?? '').trim()
+      if (query.length === 0) return { text: 'Provide the description to resolve.', isError: true }
+
+      const resolved = resolveQuery(board, {
+        query,
+        aliases: store.readAliases(meta.id),
+        railLabels: store.readRailLabels(meta.id),
+        limit: args?.limit,
+      })
+
+      const interpreted = resolved.interpreted ?? {}
+      const hints = [
+        interpreted.families?.length ? `families=${interpreted.families.join('/')}` : null,
+        interpreted.near ? `near=${interpreted.near}` : null,
+        interpreted.wantsBig ? 'wants=large' : null,
+        interpreted.wantsSmall ? 'wants=small' : null,
+        interpreted.wantsSupply ? 'wants=supply' : null,
+        interpreted.wantsGround ? 'wants=ground' : null,
+      ].filter(Boolean)
+
+      const lines = [`Matches for "${query}" on "${meta.name}"${hints.length ? ` (${hints.join(', ')})` : ''}:`]
+
+      if (resolved.parts.length > 0) {
+        lines.push('', `Components (${resolved.parts.length}):`)
+        resolved.parts.forEach((part, index) => {
+          const name = part.label !== part.refdes ? `${part.label} [${part.refdes}]` : part.refdes
+          lines.push(
+            `${index + 1}. ${name} — ${part.pins} pads${part.value ? `, marking ${part.value}` : ''}, ${part.layer}`,
+          )
+          lines.push(`   because: ${part.reasons.join('; ')}`)
+        })
+      }
+
+      if (resolved.nets.length > 0) {
+        lines.push('', `Nets (${resolved.nets.length}):`)
+        resolved.nets.forEach((net, index) => {
+          const name = net.label !== net.name ? `${net.label} [${net.name}]` : net.name
+          lines.push(`${index + 1}. ${name} — ${net.pins} pads, ${net.kind}`)
+          lines.push(`   because: ${net.reasons.join('; ')}`)
+        })
+      }
+
+      for (const note of resolved.notes) lines.push('', `note: ${note}`)
+
+      if (resolved.parts.length > 0 || resolved.nets.length > 0) {
+        lines.push(
+          '',
+          'Confirm the choice with the technician (ask_user_question with the top candidates as options), then:',
+          '  - point at it with wrenchbench_focus so the panel highlights it;',
+          '  - record any measurement with wrenchbench_mark;',
+          '  - for a rail, call wrenchbench_name_part on components or wrenchbench_checks for next probes.',
+        )
+      }
+
+      return { text: lines.join('\n') }
+    },
+  })
+
+  tools.push({
     name: 'wrenchbench_measure',
     description:
       'Physical distance between two components on the board, in millimetres (and board units). Useful when deciding whether a probe can reach a pad without moving the board.',
@@ -1428,7 +1509,15 @@ function createRoutes(ctx, config) {
 
       if (req.method === 'DELETE') {
         try {
-          store.clearObservations(id, {})
+          // A filter lets the panel clear one component rather than the board.
+          const refdes = url.searchParams.get('refdes')
+          const net = url.searchParams.get('net')
+          const kind = url.searchParams.get('kind')
+          store.clearObservations(id, {
+            refdes: refdes || undefined,
+            net: net || undefined,
+            kind: kind || undefined,
+          })
           return respond()
         } catch (error) {
           return fail(res, 400, error instanceof Error ? error.message : String(error))
@@ -1867,6 +1956,22 @@ function benchProtocolText(config) {
       '  4. isolate per component (lift one leg, or compare against a known-good pad);',
       '  5. current-limited injection plus thermal when geometry cannot separate suspects.',
       'Never propose a replacement before a measurement rules the part in.',
+      '',
+      'Resolving what the technician describes:',
+      '- When they describe rather than name something — "the big chip near the CPU",',
+      '  "the coil by the VRM", "the 3V3 rail", "shorted cap" — call',
+      '  `wrenchbench_find` FIRST. It returns real candidates with the reason each',
+      '  one matched, and an explicit refusal when nothing does.',
+      '- Never turn a description into a refdes on your own authority. Offer the',
+      '  top candidates from `wrenchbench_find` as multiple-choice options, then',
+      '  act on the one the technician picks.',
+      '- Once the target is agreed, `wrenchbench_focus` it so the panel highlights',
+      '  it, and use `wrenchbench_mark` for anything they measured.',
+      '',
+      'The panel does the same work without you: the Triage tab walks symptom →',
+      'rail → measurement and marks the board itself, and right-clicking a pad',
+      'offers mark, focus and rail labelling. Those write the same record your',
+      'tools read, so read the marks and canvas focus above before asking.',
       '',
       'Evidence rules:',
       '- Look up every refdes with `wrenchbench_component` before typing it. Never',

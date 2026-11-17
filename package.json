@@ -1,6 +1,6 @@
 {
   "name": "dsh-wrenchbench",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "WrenchBench: a board-level repair workbench in the sidebar - boardview import and canvas, per-board schematic ingestion, a persistent board library, and agent tools that read the same board the canvas shows.",
   "type": "module",
@@ -23,6 +23,7 @@
     "xzz-des.js",
     "diagnose.js",
     "naming.js",
+    "resolve.js",
     "rails.js",
     "schematic.js",
     "pdf-text.js",

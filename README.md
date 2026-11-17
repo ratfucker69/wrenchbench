@@ -24,6 +24,10 @@ Built as a feature-mimic of [wrenchboard.cloud](https://www.wrenchboard.cloud), 
 
 **Bench reasoning.** Mark a part, pad or net as short / short-to-ground / open / OK and get a deterministic ranking of what to probe next, each suspect carrying the evidence it was ranked on and one concrete measurement to take. No model call, so it cannot invent a refdes.
 
+**Describing instead of naming.** Say "the big chip near the CPU", "the coil by the VRM", "the 3V3 rail" or "shorted cap" and `wrenchbench_find` resolves it to real candidates with the reason each matched — a stated pad count, a marking, a schematic name, proximity — and refuses outright when nothing does. The agent offers the shortlist as options instead of guessing a refdes.
+
+**Working by pointing.** Right-click any pad or part for mark / focus / label-rail / copy / isolate-net / ask-the-agent. The Triage tab walks the common case with buttons only: symptom, rail, what you measured — it marks the board and ranks the next probes without a single keystroke.
+
 **A diagnostic agent, not a chatbot.** The plugin contributes a bench protocol to the agent's system prompt: one question per turn, always multiple choice with an escape option, measurement before replacement, a fault ladder, and the live bench state (rails, marks, focus, schematic) already in context. Tools hand it ready-made options, so the interview shape holds even when the prompt is under pressure.
 
 ## Install
@@ -59,6 +63,7 @@ Nothing leaves the machine. The library lives in `%APPDATA%/dsh-wrenchbench` (`~
 | `wrenchbench_boards` / `wrenchbench_board` | library list, one-board summary with rails and components |
 | `wrenchbench_import` | import from a Host path |
 | `wrenchbench_component` | look up a part by boardview label **or** alias: pads, nets, neighbours, candidates |
+| `wrenchbench_find` | resolve a plain-language description to ranked real candidates with reasons |
 | `wrenchbench_net` / `wrenchbench_search` / `wrenchbench_measure` | trace a rail, find names, physical distance |
 | `wrenchbench_schematic` | query the schematic text layer, cite pages |
 | `wrenchbench_mark` | record short / short-to-ground / open / OK |

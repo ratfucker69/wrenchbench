@@ -119,6 +119,31 @@ window.__ModuleLoader__.load({
       'startup.padEntries': "pad entries",
       'startup.namedFromSchematic': "named from the schematic",
       'startup.needReview': "need a decision",
+      'tab.triage': "Triage",
+      'triage.title': "Guided triage",
+      'triage.hint': "Pick the symptom, the rail, and what you measured. The panel marks it and ranks what to probe next — no typing, and it still works with the agent offline.",
+      'triage.step.symptom': "What is the fault?",
+      'triage.step.rail': "Which rail?",
+      'triage.step.finding': "What did you measure on it?",
+      'triage.symptom.noPower': "No power",
+      'triage.symptom.noDisplay': "No display",
+      'triage.symptom.shutdown': "Shuts down",
+      'triage.symptom.liquid': "Liquid damage",
+      'triage.finding.shortToGround': "Shorted to GND",
+      'triage.finding.short': "Shorted between nets",
+      'triage.finding.open': "Open",
+      'triage.finding.unknown': "Not measured",
+      'triage.apply': "Mark it",
+      'triage.ask': "Ask the agent",
+      'triage.focus': "Focus",
+      'menu.emptySpace': "Board",
+      'menu.focus': "Focus and zoom",
+      'menu.clearHere': "Clear marks here",
+      'menu.copyNet': "Copy net name",
+      'menu.copyRefdes': "Copy refdes",
+      'menu.copied': "Copied",
+      'menu.onlyNet': "Isolate this net",
+      'rail.labelThis': "Label this rail",
       'pinout.power': "Power",
       'pinout.ground': "GND",
       'pinout.signal': "Signals",
@@ -235,6 +260,31 @@ window.__ModuleLoader__.load({
       'startup.padEntries': "焊盘条目",
       'startup.namedFromSchematic': "已按原理图命名",
       'startup.needReview': "待确认",
+      'tab.triage': "排查",
+      'triage.title': "引导排查",
+      'triage.hint': "选择故障现象、电源轨和实测结果。面板会记录并排序下一步要探的位置——无需输入，离线也可用。",
+      'triage.step.symptom': "故障现象",
+      'triage.step.rail': "哪条电源轨",
+      'triage.step.finding': "实测结果",
+      'triage.symptom.noPower': "不上电",
+      'triage.symptom.noDisplay': "无显示",
+      'triage.symptom.shutdown': "自动关机",
+      'triage.symptom.liquid': "进液",
+      'triage.finding.shortToGround': "对地短路",
+      'triage.finding.short': "网络间短路",
+      'triage.finding.open': "开路",
+      'triage.finding.unknown': "未测量",
+      'triage.apply': "记录",
+      'triage.ask': "询问智能体",
+      'triage.focus': "定位",
+      'menu.emptySpace': "主板",
+      'menu.focus': "定位并缩放",
+      'menu.clearHere': "清除此处标记",
+      'menu.copyNet': "复制网络名",
+      'menu.copyRefdes': "复制位号",
+      'menu.copied': "已复制",
+      'menu.onlyNet': "只看此网络",
+      'rail.labelThis': "为该电源轨命名",
       'pinout.power': "供电",
       'pinout.ground': "地",
       'pinout.signal': "信号",
@@ -1224,6 +1274,11 @@ window.__ModuleLoader__.load({
           const [checks, setChecks] = React.useState({ suspects: [], notes: [] })
           const [markBusy, setMarkBusy] = React.useState(false)
           const [railEdit, setRailEdit] = React.useState(null)
+          // Right-click target on the canvas: the technician's shortcut into
+          // marking, probing and pointing the agent at what they are looking at.
+          const [menu, setMenu] = React.useState(null)
+          // Guided triage: symptom -> rail -> what was measured.
+          const [triage, setTriage] = React.useState({ symptom: null, rail: null, finding: null })
           const [aliases, setAliases] = React.useState({})
           // null = closed. { step: 'board' } is the new-project wizard.
           const [startup, setStartup] = React.useState(null)
@@ -1257,10 +1312,12 @@ window.__ModuleLoader__.load({
           const searchRef = React.useRef(null)
           const viewRef = React.useRef(view)
           const docRef = React.useRef(doc)
+          const menuRef = React.useRef(null)
           const sizeRef = React.useRef({ width: 0, height: 0 })
 
           viewRef.current = view
           docRef.current = doc
+          menuRef.current = menu
 
           const panelRef = React.useRef(null)
           // Which agent focus command this panel has already applied. Without
@@ -1611,6 +1668,29 @@ window.__ModuleLoader__.load({
             [activeId, selection, applyMarks, t],
           )
 
+          /** Mark a specific part or net, for the context menu and the wizard. */
+          const markFor = React.useCallback(
+            async (kind, target) => {
+              if (!activeId || !target) return
+              setMarkBusy(true)
+              try {
+                const body = await sendJson(`${ROUTE}/observe?id=${encodeURIComponent(activeId)}`, 'POST', {
+                  kind,
+                  refdes: target.refdes ?? undefined,
+                  net: target.refdes ? undefined : target.net ?? undefined,
+                  pin: Number.isFinite(Number(target.pin)) ? Number(target.pin) : undefined,
+                })
+                applyMarks(body)
+                setNotice(`${t('mark.marked')}: ${kind} ${target.refdes ?? target.net}`)
+              } catch (error) {
+                setNotice(error instanceof Error ? error.message : String(error))
+              } finally {
+                setMarkBusy(false)
+              }
+            },
+            [activeId, applyMarks, t],
+          )
+
           const clearMarks = React.useCallback(async () => {
             if (!activeId) return
             setMarkBusy(true)
@@ -1850,6 +1930,53 @@ window.__ModuleLoader__.load({
             }
           }, [projectPins])
 
+          /**
+            * Right-click: open the action menu for whatever is under the cursor.
+            *
+            * Left click keeps selecting (the user asked for the menu on right
+            * click), and the menu carries the actions a bench technician reaches
+            * for mid-probe: mark it, point at it, label the rail, copy the name.
+            */
+          const onContextMenu = React.useCallback(
+            (event) => {
+              const canvas = canvasRef.current
+              if (!canvas || !docRef.current) return
+              event.preventDefault()
+              const rect = canvas.getBoundingClientRect()
+              const x = event.clientX - rect.left
+              const y = event.clientY - rect.top
+              const hit = hitTest(x, y)
+              const current = docRef.current
+              if (hit?.kind === 'pin') {
+                const part = current.board.parts[hit.pin.part]
+                setSelection({
+                  refdes: part ? part.refdes : null,
+                  net: hit.pin.net,
+                  pin: hit.pin.index,
+                  annotation: null,
+                })
+                setMenu({
+                  x,
+                  y,
+                  refdes: part ? part.refdes : null,
+                  net: hit.pin.net ?? null,
+                  pin: hit.pin.index,
+                })
+                return
+              }
+              if (hit?.kind === 'part') {
+                setSelection({ refdes: hit.part.refdes, net: null, pin: null, annotation: null })
+                const owned = current.board.nets.find((net) =>
+                  net.pins.some((pinIndex) => current.board.pins[pinIndex]?.part === hit.index),
+                )
+                setMenu({ x, y, refdes: hit.part.refdes, net: owned?.name ?? null, pin: null })
+                return
+              }
+              setMenu({ x, y, refdes: null, net: null, pin: null })
+            },
+            [hitTest],
+          )
+
           const onPointerLeave = React.useCallback(() => {
             setHover(null)
           }, [])
@@ -1875,6 +2002,16 @@ window.__ModuleLoader__.load({
               setSelection({ refdes: hit.part.refdes, net: null, pin: null, annotation: null })
             },
             [hitTest],
+          )
+
+          /** Select a part and bring it into view — the inspector/wizard path. */
+          const focusRefdes = React.useCallback(
+            (refdes) => {
+              if (!refdes) return
+              setSelection({ refdes, net: null, pin: null, annotation: null })
+              zoomToPart(refdes)
+            },
+            [zoomToPart],
           )
 
           const zoomToPart = React.useCallback((refdes) => {
@@ -1918,7 +2055,10 @@ window.__ModuleLoader__.load({
               if (event.key === 'Escape') {
                 const node = searchRef.current
                 if (node && document.activeElement === node) node.blur()
-                setSelection({ refdes: null, net: null, pin: null, annotation: null })
+                // Escape closes the topmost layer first: the action menu, then
+                // the selection.
+                if (menuRef.current) setMenu(null)
+                else setSelection({ refdes: null, net: null, pin: null, annotation: null })
               }
             }
             window.addEventListener('keydown', onKey)
@@ -2036,6 +2176,36 @@ window.__ModuleLoader__.load({
 
           const probePoints = probePlan.points
           const probeMore = probePlan.more
+
+          /**
+           * Easiest points to probe on one rail, for the triage wizard.
+           *
+           * Same ordering idea as the inspector: a two-terminal passive you can
+           * reach beats a package you would have to lift, and among equals the
+           * smallest pad count wins because it is a purer measurement.
+           */
+          const triageProbe = React.useMemo(() => {
+            if (!board || !triage.rail) return []
+            const net = board.nets.find((entry) => entry.name === triage.rail)
+            if (!net) return []
+            const seen = new Set()
+            const found = []
+            for (const pinIndex of net.pins ?? []) {
+              const pin = board.pins[pinIndex]
+              if (!pin) continue
+              const part = board.parts[pin.part]
+              if (!part || seen.has(part.refdes) || part.pins === 0) continue
+              seen.add(part.refdes)
+              found.push({
+                refdes: part.refdes,
+                label: aliases[part.refdes]?.alias ?? part.refdes,
+                value: part.value ?? null,
+                pins: part.pins,
+              })
+            }
+            found.sort((a, b) => a.pins - b.pins || a.refdes.localeCompare(b.refdes))
+            return found.slice(0, 6)
+          }, [board, triage.rail, aliases])
 
           const otherNetPins = React.useMemo(() => {            if (!board || !selection.net) return []
             const net = board.nets.find((entry) => entry.name === selection.net)
@@ -2379,6 +2549,173 @@ window.__ModuleLoader__.load({
               )
             : null
 
+          // --- right-click action menu ----------------------------------------
+          const menuItem = (label, onClick, options = {}) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                disabled: Boolean(options.disabled),
+                onClick: () => {
+                  setMenu(null)
+                  onClick()
+                },
+                style: {
+                  appearance: 'none',
+                  border: 'none',
+                  background: 'transparent',
+                  color: options.danger ? T.danger : 'inherit',
+                  textAlign: 'left',
+                  padding: '5px 9px',
+                  borderRadius: 6,
+                  fontSize: 12,
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  opacity: options.disabled ? 0.4 : 1,
+                },
+              },
+              options.dot
+                ? h('span', { style: { width: 7, height: 7, borderRadius: 2, background: options.dot, flex: 'none' } })
+                : h('span', { style: { width: 7, flex: 'none' } }),
+              label,
+            )
+
+          const copyText = async (value) => {
+            try {
+              await navigator.clipboard?.writeText(String(value))
+              setNotice(`${t('menu.copied')} ${value}`)
+            } catch {
+              setNotice(String(value))
+            }
+          }
+
+          const contextMenu =
+            menu && board
+              ? h(
+                  'div',
+                  {
+                    onContextMenu: (event) => event.preventDefault(),
+                    style: {
+                      position: 'absolute',
+                      // Keep the menu on screen when the click is near an edge.
+                      left: Math.max(4, Math.min(menu.x + 6, (canvasRef.current?.clientWidth ?? 400) - 210)),
+                      top: Math.max(4, Math.min(menu.y + 6, (canvasRef.current?.clientHeight ?? 300) - 40)),
+                      zIndex: 30,
+                      minWidth: 196,
+                      maxHeight: 340,
+                      overflowY: 'auto',
+                      border: T.border,
+                      borderRadius: 10,
+                      padding: 4,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 1,
+                      background: 'var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-layer-1, #ffffff))',
+                      boxShadow: '0 10px 30px color-mix(in srgb, currentColor 18%, transparent)',
+                    },
+                  },
+                  h(
+                    'div',
+                    {
+                      style: {
+                        padding: '4px 9px 6px',
+                        fontSize: 11,
+                        color: T.muted,
+                        borderBottom: T.border,
+                        marginBottom: 3,
+                        fontFamily: T.mono,
+                      },
+                    },
+                    menu.refdes
+                      ? `${aliases[menu.refdes]?.alias ?? menu.refdes}${menu.pin ? `.${menu.pin}` : ''}${
+                          menu.net ? `  ·  ${menu.net}` : ''
+                        }`
+                      : t('menu.emptySpace'),
+                  ),
+
+                  menu.refdes
+                    ? menuItem(t('menu.focus'), () => zoomToPart(menu.refdes))
+                    : null,
+                  menu.refdes
+                    ? menuItem(t('mark.short'), () => markFor('short', { refdes: menu.refdes, pin: menu.pin }), {
+                        dot: T.danger,
+                      })
+                    : null,
+                  menu.refdes
+                    ? menuItem(t('mark.shortToGround'), () => markFor('short-to-ground', { refdes: menu.refdes, pin: menu.pin }), {
+                        dot: T.danger,
+                      })
+                    : null,
+                  menu.refdes
+                    ? menuItem(t('mark.open'), () => markFor('open', { refdes: menu.refdes, pin: menu.pin }))
+                    : null,
+                  menu.refdes
+                    ? menuItem(t('mark.ok'), () => markFor('ok', { refdes: menu.refdes, pin: menu.pin }), {
+                        dot: 'var(--dsw-alias-state-success-primary, #3f9e6b)',
+                      })
+                    : null,
+                  menu.refdes && observations.some((item) => item.refdes === menu.refdes)
+                    ? menuItem(t('menu.clearHere'), async () => {
+                        if (!activeId) return
+                        try {
+                          const body = await sendJson(
+                            `${ROUTE}/observe?id=${encodeURIComponent(activeId)}&refdes=${encodeURIComponent(menu.refdes)}`,
+                            'DELETE',
+                          )
+                          applyMarks(body)
+                        } catch (error) {
+                          setNotice(error instanceof Error ? error.message : String(error))
+                        }
+                      }, { danger: true })
+                    : null,
+                  menu.refdes ? h('div', { style: { height: 1, background: T.muted, opacity: 0.18, margin: '3px 6px' } }) : null,
+
+                  menu.net
+                    ? menuItem(t('rail.labelThis'), () => setRailEdit(menu.net))
+                    : null,
+                  menu.net
+                    ? menuItem(t('menu.onlyNet'), () => {
+                        setSelection({ refdes: menu.refdes ?? null, net: menu.net, pin: menu.pin ?? null, annotation: null })
+                        setUi((existing) => ({ ...existing, dim: true, showNetWiring: true }))
+                      })
+                    : null,
+                  menu.net
+                    ? menuItem(t('mark.shortToGround') + ' (' + t('inspector.net') + ')', () =>
+                        markFor('short-to-ground', { net: menu.net }),
+                      {
+                        dot: T.danger,
+                      })
+                    : null,
+                  menu.net
+                    ? menuItem(t('menu.copyNet'), () => copyText(menu.net))
+                    : null,
+                  menu.refdes ? menuItem(t('menu.copyRefdes'), () => copyText(menu.refdes)) : null,
+                  menu.refdes || menu.net
+                    ? h('div', { style: { height: 1, background: T.muted, opacity: 0.18, margin: '3px 6px' } })
+                    : null,
+                  menu.refdes
+                    ? menuItem(t('inspector.askAbout'), () => {
+                        setAskText(
+                          `${menu.refdes}${menu.pin ? ` pad ${menu.pin}` : ''}${menu.net ? ` on ${menu.net}` : ''} — `,
+                        )
+                        setTab('agent')
+                      })
+                    : null,
+                  menuItem(t('toolbar.fit'), () => {
+                    const canvas = canvasRef.current
+                    const zoom = fitZoom(board, canvas?.clientWidth ?? 800, canvas?.clientHeight ?? 600, view.rotation)
+                    setView((existing) => ({ ...existing, zoom, panX: 0, panY: 0 }))
+                  }),
+                  menuItem(t('startup.newProject'), () => {
+                    setStartupImported(null)
+                    setStartup({ step: 'board' })
+                  }),
+                )
+              : null
+
           const canvasArea = board
             ? h(
                 'div',
@@ -2401,15 +2738,20 @@ window.__ModuleLoader__.load({
                     ref: canvasRef,
                     className: 'wb-canvas',
                     style: { display: 'block', width: '100%', height: '100%' },
-                    onPointerDown,
+                    onPointerDown: (event) => {
+                      setMenu(null)
+                      onPointerDown(event)
+                    },
                     onPointerMove,
                     onPointerUp,
+                    onContextMenu,
                     onPointerLeave: () => {
                       setCursor(null)
                       setHover(null)
                       dragRef.current = null
                     },
                   }),
+                  contextMenu,
                   search.trim().length > 0
                     ? h(
                         'div',
@@ -2674,6 +3016,230 @@ window.__ModuleLoader__.load({
                   : null,
                 indexError ? h('div', { style: { fontSize: 12, color: T.danger } }, `${t('panel.error')}: ${indexError}`) : null,
               )
+
+          // --- guided triage --------------------------------------------------
+          // A selective path for the common case: pick the symptom, pick the
+          // rail, say what you measured, and the panel marks it and ranks what
+          // to probe. No typing, no model call — and only then does it offer to
+          // hand the same brief to the agent for the reasoning it cannot do.
+          const chipRow = (options, selected, onPick) =>
+            h(
+              'div',
+              { style: { display: 'flex', gap: 4, flexWrap: 'wrap' } },
+              options.map((option) =>
+                h(
+                  'button',
+                  {
+                    key: option.id,
+                    type: 'button',
+                    onClick: () => onPick(option.id),
+                    style: {
+                      ...BUTTON,
+                      padding: '3px 9px',
+                      fontSize: 11,
+                      borderColor: selected === option.id ? T.brand : undefined,
+                      color: selected === option.id ? T.brand : 'inherit',
+                      background: selected === option.id ? 'color-mix(in srgb, currentColor 8%, transparent)' : 'transparent',
+                    },
+                  },
+                  option.label,
+                ),
+              ),
+            )
+
+          const triageBrief = () => {
+            const rail = triage.rail
+              ? `${rails.find((entry) => entry.name === triage.rail)?.label ?? triage.rail}`
+              : 'an unknown rail'
+            const symptom = triage.symptom ? t(`triage.symptom.${triage.symptom}`) : 'an unreported fault'
+            const finding = triage.finding ? t(`triage.finding.${triage.finding}`) : 'not measured yet'
+            return [
+              `Board: ${board?.meta?.name ?? activeMeta?.name ?? 'unknown'} (focused in the WrenchBench panel).`,
+              `Symptom: ${symptom}.`,
+              `Rail in question: ${rail}${triage.rail ? ` (${triage.rail})` : ''}.`,
+              `Measured: ${finding}.`,
+              triageProbe.length > 0
+                ? `Easiest points on that rail: ${triageProbe.map((point) => point.label).join(', ')}.`
+                : '',
+              'Work this as a bench interview: one question per turn with options, then record what I measure.',
+            ]
+              .filter(Boolean)
+              .join('\n')
+          }
+
+          const triagePane = h(
+            'div',
+            { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, flex: 1 } },
+            h(SectionLabel, null, t('triage.title')),
+            h('div', { style: { fontSize: 11.5, color: T.muted, lineHeight: 1.5 } }, t('triage.hint')),
+
+            h(
+              'div',
+              { style: { border: T.border, borderRadius: 10, padding: 9, display: 'flex', flexDirection: 'column', gap: 7 } },
+              h('div', { style: { fontSize: 11, color: T.muted } }, `1 · ${t('triage.step.symptom')}`),
+              chipRow(
+                [
+                  { id: 'noPower', label: t('triage.symptom.noPower') },
+                  { id: 'noDisplay', label: t('triage.symptom.noDisplay') },
+                  { id: 'shutdown', label: t('triage.symptom.shutdown') },
+                  { id: 'liquid', label: t('triage.symptom.liquid') },
+                ],
+                triage.symptom,
+                (id) => setTriage((existing) => ({ ...existing, symptom: existing.symptom === id ? null : id })),
+              ),
+              h('div', { style: { fontSize: 11, color: T.muted } }, `2 · ${t('triage.step.rail')}`),
+              rails.length > 0
+                ? chipRow(
+                    rails.slice(0, 8).map((rail) => ({
+                      id: rail.name,
+                      label: `${rail.label && rail.label !== rail.name ? rail.label : rail.name}`,
+                    })),
+                    triage.rail,
+                    (id) => setTriage((existing) => ({ ...existing, rail: existing.rail === id ? null : id })),
+                  )
+                : h('div', { style: { fontSize: 11, color: T.muted } }, t('rail.none')),
+              h('div', { style: { fontSize: 11, color: T.muted } }, `3 · ${t('triage.step.finding')}`),
+              chipRow(
+                [
+                  { id: 'shortToGround', label: t('triage.finding.shortToGround') },
+                  { id: 'short', label: t('triage.finding.short') },
+                  { id: 'open', label: t('triage.finding.open') },
+                  { id: 'unknown', label: t('triage.finding.unknown') },
+                ],
+                triage.finding,
+                (id) => setTriage((existing) => ({ ...existing, finding: existing.finding === id ? null : id })),
+              ),
+              h(
+                'div',
+                { style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    disabled: !triage.rail || !triage.finding || triage.finding === 'unknown' || markBusy,
+                    onClick: () => {
+                      const kind =
+                        triage.finding === 'shortToGround'
+                          ? 'short-to-ground'
+                          : triage.finding === 'short'
+                            ? 'short'
+                            : 'open'
+                      markFor(kind, { net: triage.rail })
+                    },
+                    style: { ...BUTTON, padding: '4px 10px', fontSize: 11.5, borderColor: T.danger, color: T.danger },
+                  },
+                  t('triage.apply'),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    disabled: !board,
+                    onClick: () => {
+                      setAskText(triageBrief())
+                      setTab('agent')
+                    },
+                    style: { ...BUTTON, padding: '4px 10px', fontSize: 11.5, borderColor: T.brand, color: T.brand },
+                  },
+                  t('triage.ask'),
+                ),
+              ),
+            ),
+
+            triageProbe.length > 0
+              ? h(
+                  'div',
+                  { style: { border: T.border, borderRadius: 10, padding: 9, display: 'flex', flexDirection: 'column', gap: 3 } },
+                  h(
+                    'div',
+                    { style: { fontSize: 10.5, color: T.muted, letterSpacing: 0.4, textTransform: 'uppercase' } },
+                    `${t('probe.title')} ${rails.find((entry) => entry.name === triage.rail)?.label ?? triage.rail}`,
+                  ),
+                  triageProbe.map((point) =>
+                    h(
+                      'button',
+                      {
+                        key: point.refdes,
+                        type: 'button',
+                        onClick: () => zoomToPart(point.refdes),
+                        style: {
+                          display: 'flex',
+                          gap: 6,
+                          alignItems: 'baseline',
+                          background: 'transparent',
+                          border: 'none',
+                          padding: '1px 0',
+                          font: 'inherit',
+                          fontSize: 11,
+                          color: 'inherit',
+                          textAlign: 'left',
+                          cursor: 'pointer',
+                        },
+                      },
+                      h('span', { style: { fontFamily: T.mono, minWidth: 46 } }, point.label),
+                      h('span', { style: { color: T.muted, flex: 1 } }, point.value ?? `${point.pins} ${t('inspector.pins')}`),
+                    ),
+                  ),
+                )
+              : null,
+
+            (checks?.suspects ?? []).length > 0
+              ? h(
+                  'div',
+                  { style: { border: T.border, borderRadius: 10, padding: 9, display: 'flex', flexDirection: 'column', gap: 5, minHeight: 0, overflowY: 'auto' } },
+                  h('div', { style: { fontSize: 10.5, color: T.muted, letterSpacing: 0.4, textTransform: 'uppercase' } }, t('checks.title')),
+                  checks.suspects.slice(0, 6).map((suspect, rank) =>
+                    h(
+                      'div',
+                      { key: suspect.refdes, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                      h(
+                        'div',
+                        { style: { display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 11.5 } },
+                        h(
+                          'span',
+                          {
+                            style: {
+                              width: 15,
+                              height: 15,
+                              borderRadius: 999,
+                              fontSize: 9.5,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              background: rank === 0 ? T.danger : T.brand,
+                              color: 'var(--dsw-alias-bg-base, #ffffff)',
+                              flex: 'none',
+                            },
+                          },
+                          String(rank + 1),
+                        ),
+                        h('span', { style: { fontFamily: T.mono, fontWeight: 600 } }, aliases[suspect.refdes]?.alias ?? suspect.refdes),
+                        h('span', { style: { flex: 1 } }),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            onClick: () => focusRefdes(suspect.refdes),
+                            style: { ...BUTTON, padding: '1px 7px', fontSize: 10.5 },
+                          },
+                          t('triage.focus'),
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            onClick: () => markFor('ok', { refdes: suspect.refdes }),
+                            style: { ...BUTTON, padding: '1px 7px', fontSize: 10.5 },
+                          },
+                          t('mark.ok'),
+                        ),
+                      ),
+                      h('div', { style: { fontSize: 10.5, color: T.muted, lineHeight: 1.4 } }, (suspect.evidence ?? []).slice(0, 2).join('; ')),
+                    ),
+                  ),
+                )
+              : null,
+          )
 
           const inspector = board
             ? h(
@@ -3239,10 +3805,11 @@ window.__ModuleLoader__.load({
               'div',
               { style: { display: 'flex', gap: 5 } },
               tabButton('board', t('tab.board')),
+              tabButton('triage', t('tab.triage')),
               tabButton('agent', t('tab.agent')),
               tabButton('schematic', t('tab.schematic')),
             ),
-            tab === 'agent' ? agentPane : tab === 'schematic' ? schematicPane : inspector,
+            tab === 'triage' ? triagePane : tab === 'agent' ? agentPane : tab === 'schematic' ? schematicPane : inspector,
           )
 
           // --- new-project wizard ---------------------------------------------
