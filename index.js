@@ -21,6 +21,7 @@ import { BoardParseError, parseBoard, SUPPORTED_EXTENSIONS } from './parsers.js'
 import { pagesForToken, searchSchematic } from './pdf-text.js'
 import { extractSchematic } from './schematic.js'
 import { assignComponentRails, classifyRails, deriveRailAliases, voltageOf } from './rails.js'
+import { matchSchematicRails } from './schematic-rails.js'
 import { classifyParts, displayRefdes, isPlaceholderRefdes, planNaming } from './naming.js'
 import { resolveQuery } from './resolve.js'
 import { nextChecks } from './diagnose.js'
@@ -267,7 +268,9 @@ function applyRailLabels(rails, labels) {
     const owned = labels?.[rail.name]
     if (owned?.label) {
       rail.label = owned.label
-      rail.labelSource = 'bench'
+      rail.labelSource = owned.source ?? 'bench'
+      rail.labelConfidence = owned.confidence ?? (rail.labelSource === 'bench' ? 'confirmed' : null)
+      rail.labelEvidence = owned.evidence ?? []
       const volts = voltageOf(owned.label)
       if (volts !== null) rail.voltage = volts
     } else if (rail.alias) {
@@ -346,6 +349,7 @@ function enrichBoard(id) {
   store.writeAliases(id, next)
   const named = Object.values(next).filter((entry) => entry.alias).length
   const ambiguous = Object.values(next).filter((entry) => !entry.alias && (entry.candidates ?? []).length > 0).length
+  const rails = schematic ? nameRailsFromSchematic(id, loaded.board, schematic) : null
   return {
     id,
     name: loaded.meta.name,
@@ -355,8 +359,63 @@ function enrichBoard(id) {
     named,
     ambiguous,
     unnamed: plan.unnamedCount,
+    rails,
     schematic: schematic ? { name: schematic.name, pages: schematic.stats.pages } : null,
   }
+}
+
+/**
+ * Name the board's opaque rails from the schematic, automatically.
+ *
+ * Called from the enrichment that runs after every import and after every
+ * schematic upload, so a new project is labelled without anyone asking. A
+ * schematic pins a supply once per pin (`VDDCR_GFX_A12`, …), which gives the
+ * number of pins that supply reaches on one device; the boardview gives the
+ * number of that device's pads on a net. Those are the same count, so a unique
+ * pair forces the naming — see schematic-rails.js.
+ *
+ * A label the technician already typed is never touched. Anything the counts
+ * cannot separate is written down as an open choice, not as a name.
+ */
+function nameRailsFromSchematic(id, board, schematic) {
+  let match
+  try {
+    match = matchSchematicRails(board, schematic)
+  } catch (error) {
+    return { applied: 0, kept: 0, ambiguous: 0, error: String(error?.message ?? error) }
+  }
+
+  const labels = store.readRailLabels(id)
+  let applied = 0
+  let kept = 0
+  for (const assignment of match.assignments) {
+    const prior = labels[assignment.net]
+    if (prior?.label && prior.source !== 'schematic') {
+      kept += 1
+      continue
+    }
+    store.setRailLabel(id, assignment.net, assignment.rail, {
+      source: 'schematic',
+      confidence: assignment.confidence,
+      evidence: assignment.evidence,
+    })
+    applied += 1
+  }
+
+  const map = {
+    at: new Date().toISOString(),
+    schematic: schematic.name ?? null,
+    assignments: match.assignments,
+    // Only choices a technician can act on: an ambiguous count, or an equality
+    // too small to assert on its own.
+    ambiguous: match.ambiguous.filter((entry) => entry.confidence === 'choice' || entry.nets.length === 1),
+    parts: match.parts,
+    rails: match.rails.map((rail) => ({ name: rail.name, pins: rail.pins })),
+    unmatched: match.unmatched.map((rail) => ({ name: rail.name, pins: rail.pins })),
+    warnings: match.warnings,
+  }
+  store.writeRailMap(id, map)
+  return { applied, kept, ambiguous: map.ambiguous.length, error: match.warnings[0] ?? null }
 }
 
 /** Human-readable enrichment report, shared by the route and the tool. */
@@ -381,6 +440,23 @@ function enrichmentReport(report) {
     }
   }
   if (report.kept > 0) lines.push(`  ${report.kept} name(s) already confirmed at the bench were left alone.`)
+  const rails = report.rails
+  if (rails) {
+    if (rails.error && rails.applied === 0) {
+      lines.push(`  Rail names: nothing could be matched — ${rails.error}`)
+    } else {
+      lines.push(
+        `  Rail names: ${rails.applied} net(s) named from the schematic by pin-count fingerprint${rails.kept > 0 ? `, ${rails.kept} kept as labelled at the bench` : ''}.`,
+      )
+      if (rails.ambiguous > 0) {
+        lines.push(
+          `  ${rails.ambiguous} rail(s) are an open choice between candidate names; ask which one it is, then record it with wrenchbench_label_rail.`,
+        )
+      }
+    }
+  } else if (report.schematic) {
+    lines.push('  Rail names: the schematic carried no pin-positioned supply nets to fingerprint.')
+  }
   return lines.join('\n')
 }
 
@@ -1171,6 +1247,81 @@ function buildTools(ctx, config) {
   })
 
   tools.push({
+    name: 'wrenchbench_rail_map',
+    description:
+      "Show how a board's opaque nets were named from the schematic, and what is still an open choice. A boardview that calls every net Net72 cannot say which is 1.8 V, but a schematic prints a supply once per pin (VDDCR_GFX_A12, …) so the count of pins under one supply equals the count of that device's pads on the net in the boardview. Unique counts on both sides name the rail; counts that collide are returned as choices for the technician, never as a name. This runs automatically after every import and schematic upload, so call it to see the current state, or after replacing either file.",
+    parameters: {
+      type: 'object',
+      properties: {
+        board: { type: 'string', description: 'Board id or name. Defaults to the board on the canvas.' },
+      },
+    },
+    output: { schema: TOOL_OUTPUT_SCHEMA, render: renderToolOutput },
+    execute: (args) => {
+      const loaded = loadBoard(args?.board)
+      if (loaded.error) return { text: loaded.error, isError: true }
+      const { meta, board } = loaded
+      const schematic = store.readSchematic(meta.id)
+      if (!schematic) {
+        return {
+          text: `"${meta.name}" has no schematic attached, so no rail can be named from one. Attach the PDF (or a text/CSV netlist) and enrichment runs again automatically.`,
+          isError: true,
+        }
+      }
+
+      const match = matchSchematicRails(board, schematic)
+      const labels = store.readRailLabels(meta.id)
+      const named = match.assignments.map((assignment) => {
+        const owned = labels[assignment.net]
+        const shown = owned?.label ?? assignment.rail
+        const from = owned?.source === 'schematic' ? 'schematic' : owned?.label ? 'bench' : 'unapplied'
+        return `${assignment.net} = ${shown} — ${assignment.pins} pads on ${assignment.part}, ${assignment.pins} pins on ${assignment.rail} in the schematic (${from}${assignment.confidence === 'high' ? ', high' : ', medium'})`
+      })
+
+      const choices = match.ambiguous.filter((entry) => entry.confidence === 'choice')
+      const small = match.ambiguous.filter((entry) => entry.confidence !== 'choice')
+      const lines = [`Rail map for "${meta.name}" against "${schematic.name}":`]
+      lines.push(
+        named.length > 0
+          ? `  Named by pin-count fingerprint:\n${named.map((line) => `    ${line}`).join('\n')}`
+          : '  No net could be named: no unique pin count matched a net on any part.',
+      )
+      if (choices.length > 0) {
+        lines.push('  Open choices — the counts collide, so this is the technician\'s call:')
+        for (const entry of choices.slice(0, 5)) {
+          lines.push(
+            `    ${entry.count} pins on ${entry.part}: nets ${entry.nets.join(', ')} ↔ supplies ${entry.supplies.join(', ')}`,
+          )
+        }
+      }
+      if (small.length > 0) {
+        lines.push(
+          `  Suggested but not applied (below the 20-pin threshold): ${small
+            .map((entry) => `${entry.nets.join('/')} = ${entry.supplies.join('/')} (${entry.count} pads)`)
+            .join('; ')}`,
+        )
+      }
+      if (match.unmatched.length > 0) {
+        lines.push(
+          `  Supplies in the schematic that matched no net: ${match.unmatched.map((rail) => `${rail.name} (${rail.pins} pins)`).join(', ')}`,
+        )
+      }
+      for (const warning of match.warnings) lines.push(`  ${warning}`)
+
+      if (choices.length > 0) {
+        const entry = choices[0]
+        const options = entry.supplies.slice(0, 4).map((name) => ({ label: name, description: `${entry.count} pins` }))
+        options.push({ label: 'not sure yet', description: 'leave it unnamed' })
+        lines.push('')
+        lines.push(
+          `ask_user_question: { question: "Which supply is ${entry.nets[0]} on ${entry.part}?", header: "Rail", options: ${JSON.stringify(options)} }`,
+        )
+      }
+      return { text: lines.join('\n') }
+    },
+  })
+
+  tools.push({
     name: 'wrenchbench_enrich',
     description:
       'Re-run the automatic project enrichment on a board: separate pad/test-point entries from real components, and try to name the parts the boardview could not label using the attached schematic. It already runs after every import and every schematic upload, so call this only after something changed outside the panel (a file replaced on disk), or to see the current naming report.',
@@ -1471,6 +1622,7 @@ function createRoutes(ctx, config) {
           : null,
         rails: railModel.rails,
         railThreshold: railModel.threshold,
+        railMap: store.readRailMap(id),
         railOfPart: [...railModel.assignment.entries()].map(([partIndex, net]) => [partIndex, net]),
         aliases: store.readAliases(id),
         observations,
@@ -1636,7 +1788,12 @@ function createRoutes(ctx, config) {
       if (!known) return fail(res, 422, `the board has no net named "${net}"`)
 
       try {
-        store.setRailLabel(id, net, body?.label ?? null)
+        // A label typed at the bench overrides a schematic-derived one, so it
+        // is recorded with its own provenance and wins from here on.
+        store.setRailLabel(id, net, body?.label ?? null, {
+          source: 'bench',
+          confidence: 'confirmed',
+        })
       } catch (error) {
         return fail(res, 400, error instanceof Error ? error.message : String(error))
       }
@@ -1646,9 +1803,19 @@ function createRoutes(ctx, config) {
         aliases: railAliasesFor(id, loaded.board, schematic),
       })
       applyRailLabels(railModel.rails, store.readRailLabels(id))
+      // An entry the technician has now answered stops being an open question.
+      const map = store.readRailMap(id)
+      if (map && Array.isArray(map.ambiguous)) {
+        const answered = String(body?.label ?? '').trim().length > 0 ? net : null
+        if (answered) {
+          const next = { ...map, ambiguous: map.ambiguous.filter((entry) => !entry.nets.includes(answered)) }
+          store.writeRailMap(id, next)
+        }
+      }
       return sendJson(res, 200, {
         rails: railModel.rails,
         railOfPart: [...railModel.assignment.entries()],
+        railMap: store.readRailMap(id),
       })
     },
   })

@@ -56,6 +56,29 @@ If your setup has no `dsh` CLI on `PATH`, add the package to your profile instea
 
 Nothing leaves the machine. The library lives in `%APPDATA%/dsh-wrenchbench` (`~/.local/share/dsh-wrenchbench` on Linux).
 
+## Naming rails from the schematic
+
+A vendor boardview calls every net `Net72`, and its designators (`C00173`, `N16136`) share no namespace with the schematic's (`C1027`, `IC4001`). Name-matching and refdes-matching across the two files are therefore both impossible, and guessing a voltage from fan-out would put a technician on the wrong rail.
+
+What survives the renumbering is arithmetic. A schematic prints a supply once per pin, and those labels carry the pin position — `VDDCR_GFX_A12`, `VDDCR_GFX_A14`, … Counting the distinct positions under one supply gives the number of pins that supply reaches *on that device*. The boardview then gives the number of that device's pads on one net. When a pin count is unique among the schematic's supplies **and** unique among that part's nets, the pairing is forced:
+
+```
+VDDCR_GFX 240 pins ── Net73  240 pads on N15900   high
+VDDCR_CORE 104 pins ── Net108 104 pads on N15900   high
+VMEMIO      80 pins ── Net72   80 pads on N15900   high
+VMEMP       47 pins ── Net74   47 pads on N15900   high
+VDDCR_SOC   32 pins ── Net75   32 pads on N15900   medium
+```
+
+This runs by itself after every import and every schematic upload. The rules that keep it honest:
+
+- **Under 20 pins nothing is written down.** Nineteen different parts on the EDM-010 own exactly one 5-pad net, so a small equality proves nothing. 8–19 pins is offered as a suggestion for the technician; 20 and up is applied.
+- **Counts that collide stay unnamed.** Two nets with the same pad count, or two supplies with the same pin count, become a click-to-choose row in the rail legend — never a guess. Nothing is silently picked.
+- **Ground and no-connect nets are never named**, and a supply can only be claimed once.
+- **A bench label always wins.** `wrenchbench_label_rail` writes `source: bench` and enrichment will not overwrite it.
+
+Every applied name stores its evidence (page, pin count, pad count, the uniqueness argument), which is what the `sch` badge in the legend shows on hover. If the schematic prints nothing position-tagged, the feature says so instead of inventing names.
+
 ## Agent tools
 
 | Tool | Purpose |
@@ -69,7 +92,8 @@ Nothing leaves the machine. The library lives in `%APPDATA%/dsh-wrenchbench` (`~
 | `wrenchbench_mark` | record short / short-to-ground / open / OK |
 | `wrenchbench_checks` | deterministic ranked next suspects + a ready-to-ask question |
 | `wrenchbench_focus` | move the canvas focus the technician is looking at |
-| `wrenchbench_label_rail` | give an anonymous net its real rail name |
+| `wrenchbench_label_rail` | give an anonymous net its real rail name (overrides a schematic match) |
+| `wrenchbench_rail_map` | show how each opaque net got its name, and which rails are still an open choice |
 | `wrenchbench_name_part` / `wrenchbench_enrich` | confirm a part name, re-run the naming pass |
 
 ## Tests

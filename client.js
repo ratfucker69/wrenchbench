@@ -1323,6 +1323,8 @@ window.__ModuleLoader__.load({
           const [selection, setSelection] = React.useState({ refdes: null, net: null, pin: null, annotation: null })
           const [schematic, setSchematic] = React.useState(null)
           const [rails, setRails] = React.useState([])
+          // How those rails got their names, and which ones are still a choice.
+          const [railMap, setRailMap] = React.useState(null)
           const [railOfPart, setRailOfPart] = React.useState(null)
           const [observations, setObservations] = React.useState([])
           const [checks, setChecks] = React.useState({ suspects: [], notes: [] })
@@ -1442,6 +1444,7 @@ window.__ModuleLoader__.load({
                 setDoc(body)
                 setSchematic(body.schematic ?? null)
                 setRails(Array.isArray(body.rails) ? body.rails : [])
+                setRailMap(body.railMap ?? null)
                 setRailOfPart(new Map(Array.isArray(body.railOfPart) ? body.railOfPart : []))
                 setObservations(Array.isArray(body.observations) ? body.observations : [])
                 setChecks(body.checks ?? { suspects: [], notes: [] })
@@ -1773,6 +1776,7 @@ window.__ModuleLoader__.load({
                   label: text,
                 })
                 if (Array.isArray(body?.rails)) setRails(body.rails)
+                if (body && 'railMap' in body) setRailMap(body.railMap ?? null)
                 if (Array.isArray(body?.railOfPart)) setRailOfPart(new Map(body.railOfPart))
               } catch (error) {
                 setNotice(error instanceof Error ? error.message : String(error))
@@ -2972,8 +2976,71 @@ window.__ModuleLoader__.load({
                                   { style: { color: T.muted, flex: 'none' } },
                                   rail.voltage === null ? `${rail.pads} ${t('rail.pads')}` : `${rail.voltage} V`,
                                 ),
+                                // Where the name came from. A schematic match is
+                                // arithmetic, not a label someone typed, so it says so
+                                // and carries the counts that produced it.
+                                rail.labelSource === 'schematic'
+                                  ? h(
+                                      'span',
+                                      {
+                                        title: (rail.labelEvidence ?? []).join('\n') || t('rail.fromSchematic'),
+                                        style: {
+                                          flex: 'none',
+                                          fontSize: 9,
+                                          letterSpacing: 0.3,
+                                          textTransform: 'uppercase',
+                                          color: rail.labelConfidence === 'high' ? T.brand : T.muted,
+                                          border: T.border,
+                                          borderRadius: 4,
+                                          padding: '0 3px',
+                                        },
+                                      },
+                                      t('rail.schematicTag'),
+                                    )
+                                  : null,
                               ),
                         ),
+                        // Counts that collide leave a real choice; offer the
+                        // candidates here so it is one click, not a question.
+                        ...(railMap && Array.isArray(railMap.ambiguous) ? railMap.ambiguous : [])
+                          .slice(0, 3)
+                          .map((entry, index) => {
+                            // Stored by the host, but never assume its shape: a
+                            // malformed entry must not blank the pane.
+                            const net = Array.isArray(entry?.nets) ? entry.nets[0] : null
+                            const supplies = Array.isArray(entry?.supplies) ? entry.supplies : []
+                            if (!net) return null
+                            return h(
+                              'div',
+                              {
+                                key: `open-${index}`,
+                                style: { marginTop: 5, paddingTop: 4, borderTop: T.border, color: T.muted },
+                              },
+                              h('div', { style: { fontFamily: T.mono, fontSize: 10 } }, `${net} · ${entry.count}p`),
+                              h(
+                                'div',
+                                { style: { display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 2 } },
+                                ...supplies.slice(0, 3).map((name) =>
+                                  h(
+                                    'button',
+                                    {
+                                      key: name,
+                                      type: 'button',
+                                      title: t('rail.openChoice'),
+                                      onClick: () => saveRailLabel(net, name),
+                                      style: BUTTON,
+                                    },
+                                    name,
+                                  ),
+                                ),
+                                h(
+                                  'button',
+                                  { key: 'skip', type: 'button', onClick: () => saveRailLabel(net, ''), style: BUTTON },
+                                  t('rail.skipChoice'),
+                                ),
+                              ),
+                            )
+                          }),
                         h(
                           'div',
                           { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 3, color: T.muted } },

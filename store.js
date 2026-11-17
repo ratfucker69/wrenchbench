@@ -88,6 +88,10 @@ function railLabelsFile(id) {
   return path.join(boardDir(id), 'rails.json')
 }
 
+function railMapFile(id) {
+  return path.join(boardDir(id), 'railmap.json')
+}
+
 function aliasesFile(id) {
   return path.join(boardDir(id), 'aliases.json')
 }
@@ -364,20 +368,55 @@ export function readRailLabels(id) {
 /**
  * Set or clear one rail label.
  *
+ * The label carries where it came from. A name typed at the bench is the
+ * technician's own evidence and outranks anything inferred; a name matched from
+ * the schematic keeps its confidence and the counts it was built from, so the
+ * panel can show why it says `VDDCR_GFX` instead of `Net73`.
+ *
  * @param {string} id board id
  * @param {string} net the real net name on the board
  * @param {string|null} label the display label; null or empty clears it
+ * @param {object} [extra] provenance: `{source, confidence, evidence, at}`
  */
-export function setRailLabel(id, net, label) {
+export function setRailLabel(id, net, label, extra = {}) {
   if (!isBoardId(id)) throw new Error('unknown board')
   const name = String(net ?? '').trim()
   if (name.length === 0) throw new Error('a net name is required')
   const labels = readRailLabels(id)
   const text = label === null || label === undefined ? '' : String(label).trim().slice(0, 48)
   if (text.length === 0) delete labels[name]
-  else labels[name] = { label: text, at: new Date().toISOString() }
+  else {
+    labels[name] = {
+      label: text,
+      source: typeof extra.source === 'string' && extra.source.length > 0 ? extra.source : 'bench',
+      confidence: typeof extra.confidence === 'string' ? extra.confidence : null,
+      evidence: Array.isArray(extra.evidence) ? extra.evidence.slice(0, 6) : [],
+      at: new Date().toISOString(),
+    }
+  }
   writeAtomic(railLabelsFile(id), JSON.stringify(labels, null, 2))
   return labels
+}
+
+/**
+ * The last schematic-to-board rail match, with its evidence and open choices.
+ *
+ * Stored next to the labels rather than inside them: a label is committed
+ * knowledge, a map entry is an argument, and the ambiguous rows are questions.
+ *
+ * @returns {{assignments: object[], ambiguous: object[], parts: object[], rails: object[], unmatched: object[], warnings: string[], at: string}|null}
+ */
+export function readRailMap(id) {
+  if (!isBoardId(id)) return null
+  const stored = readJson(railMapFile(id))
+  return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : null
+}
+
+/** Replace the stored rail match for one board. */
+export function writeRailMap(id, map) {
+  if (!isBoardId(id)) return null
+  writeAtomic(railMapFile(id), JSON.stringify(map ?? {}, null, 2))
+  return map
 }
 
 /**
