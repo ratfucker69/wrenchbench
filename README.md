@@ -53,7 +53,8 @@ If your setup has no `dsh` CLI on `PATH`, add the package to your profile instea
 2. **Board tab** — `↑` toggles rail colouring, the rail legend is click-to-label, the inspector shows the part, its marking, its pads, its rail, its bench marks, and the ranked next checks.
 3. **Agent tab** — ask in plain language. The agent drives the canvas (`focus`), records marks, and answers with one question.
 4. **Schematic tab** — search the text layer for a refdes, rail or page title; results cite page numbers.
-5. **CSV** on a library entry — the bench record as a spreadsheet: parts, pad counts, every rail with its voltage and evidence, the marks with timings, the part names you set and the schema evidence behind each rail name.
+5. **`?`** in the tab row opens the command list — every gesture the panel answers to and every tool the agent has, in one place. It exists because nobody remembers a right-click menu they were told about once.
+6. **CSV** on a library entry — the bench record as a spreadsheet: parts, pad counts, every rail with its voltage and evidence, the marks with timings, the part names you set and the schema evidence behind each rail name.
 
 Nothing leaves the machine. The library lives in `%APPDATA%/dsh-wrenchbench` (`~/.local/share/dsh-wrenchbench` on Linux).
 
@@ -64,6 +65,8 @@ Repair questions do not run in a workspace conversation. WrenchBench owns one se
 - it is created in `~/.dsh/wrenchbench/repair/<board-id>`, so the workspace session list has nothing to show;
 - its id is remembered in the board's own record, so a repair thread survives a restart;
 - the panel draws the transcript itself (question, answer, and the tools the agent used), which is why the Ask tab is the only place a bench conversation appears.
+
+A repair thread still shows up in the harness session list, as an entry grouped under its own working directory rather than under your workspace — that is what the list shows as an ungrouped session. It is the bench conversation for one board: `~/.dsh/wrenchbench/repair/<board-id>` is where it runs, so the grouping follows the bench, not your projects. Deleting the board takes its group with it, and a start-up sweep drops groups whose board is no longer in the library — including ones left by an earlier version of the plugin.
 
 The agent is the same agent loop, tools and model as anywhere else — only the session is separate. The reply context (board, rail groups with their voltages, marks, canvas focus) reaches it through the system prompt, so the technician's own words go in verbatim and come back exactly as drawn. Harness scaffolding — runtime-context blocks, skill notices, checkpoint messages — is filtered out of the transcript rather than shown as if they had typed it.
 

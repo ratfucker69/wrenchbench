@@ -160,13 +160,45 @@ export function createRepairThread({ ctx, root, store }) {
     return { sessionId }
   }
 
-  /** The board's thread, created on first use. */
+  /**
+   * The board's thread, created on first use.
+   *
+   * A remembered id is only trusted while the session service still knows it.
+   * The store groups sessions by working directory, so a group can disappear
+   * (a swept store, a cleared profile) while the board record still carries its
+   * id — and prompting into a session that no longer exists would fail at the
+   * bench with a message about nothing. A stale id is therefore replaced, not
+   * reused.
+   */
   async function ensure(boardId, boardName) {
     const existing = readId(boardId)
-    if (existing) return { sessionId: existing, created: false }
+    if (existing && (await sessionExists(existing))) return { sessionId: existing, created: false }
     const made = await create(boardId, boardName)
     if (made.error) return made
     return { sessionId: made.sessionId, created: true }
+  }
+
+  /** True when the session service can still see a session by id. */
+  async function sessionExists(sessionId) {
+    const service = controller()
+    if (!service) return false
+    if (typeof service.inspect === 'function') {
+      try {
+        const inspected = await service.inspect(sessionId)
+        if (inspected && typeof inspected === 'object') return true
+      } catch {
+        return false
+      }
+    }
+    if (typeof service.list === 'function') {
+      try {
+        const listed = await service.list({})
+        return (listed?.items ?? []).some((item) => String(item.sessionId) === String(sessionId))
+      } catch {
+        return false
+      }
+    }
+    return true
   }
 
   /** Start the thread over, leaving the old one behind. */
@@ -266,7 +298,7 @@ export function createRepairThread({ ctx, root, store }) {
    * live on that session — a repair in progress must not be deleted from under
    * the technician.
    */
-  async function forget(boardId) {
+  async function forget(boardId, knownSessionId = null) {
     let removed = { sessionDirectory: false, harnessDirectory: false }
     try {
       fs.rmSync(dirFor(boardId), { recursive: true, force: true })
@@ -274,7 +306,11 @@ export function createRepairThread({ ctx, root, store }) {
     } catch {
       // Left behind; the sweep below will try again next start.
     }
-    const stored = readId(boardId)
+    // The caller must hand over the id it read before the board moved to the
+    // trash: once the board directory is gone the record is gone with it, and
+    // reading it here silently skipped the harness session — which is how ten
+    // orphan session groups were left behind by the feature tour.
+    const stored = knownSessionId ?? readId(boardId)
     if (stored) {
       const agents = ctx.get('agents')
       const live = agents && typeof agents.get === 'function' ? agents.get(stored) : undefined
@@ -301,10 +337,14 @@ export function createRepairThread({ ctx, root, store }) {
    * behind, which grows without bound over a repair bench. Called at start.
    */
   function sweep(liveBoardIds) {
+    // Session groups first, while this module's own repair directories are still
+    // on disk: a group whose board has a repair directory here is live, whatever
+    // the listing said. An orphan group then goes on the next start, after its
+    // repair directory has been removed by this pass.
+    let swept = sweepHarnessGroups(liveBoardIds)
     // Only this module's own directory is touched, and only directory entries
     // that look like board ids: a wider sweep here once reached the library.
     const repairRoot = path.join(root, 'repair')
-    let swept = 0
     let entries = []
     try {
       entries = fs.readdirSync(repairRoot, { withFileTypes: true })
@@ -320,6 +360,52 @@ export function createRepairThread({ ctx, root, store }) {
         swept += 1
       } catch {
         // Locked or already gone.
+      }
+    }
+    return swept
+  }
+
+  /**
+   * Drop this module's session groups for boards that no longer exist.
+   *
+   * The session store names a group after the working directory, so a repair
+   * thread leaves `…-wrenchbench-repair-<board-id>--` in the harness session
+   * list. Those are the entries a technician sees as ungrouped sessions, and a
+   * deleted board has no reason to keep one. The match is deliberately narrow —
+   * the group must carry the `wrenchbench-repair` segment *and* end in a board id
+   * that is not in the library — so no other session can be caught by it.
+   */
+  function sweepHarnessGroups(liveBoardIds) {
+    // An empty or missing listing means the library could not be read, not that
+    // every board is gone: sweeping on that reading would take a bench's repair
+    // history with it. Refuse to sweep without a listing.
+    if (!Array.isArray(liveBoardIds) || liveBoardIds.length === 0) return 0
+    const sessionsRoot = path.join(process.env.USERPROFILE ?? process.env.HOME ?? os.homedir(), '.dsh', 'sessions')
+    let swept = 0
+    let entries = []
+    try {
+      entries = fs.readdirSync(sessionsRoot, { withFileTypes: true })
+    } catch {
+      return 0
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      if (!entry.name.includes('-wrenchbench-repair-')) continue
+      const match = /-wrenchbench-repair-([a-z0-9][a-z0-9-]{0,80})--$/.exec(entry.name)
+      if (!match) continue
+      if (liveBoardIds.includes(match[1])) continue
+      // Two facts must agree before a group goes: the board is not in the
+      // library, and this module's own directory for it is gone too. A board
+      // whose repair directory is still there is live, whatever the listing
+      // said at start-up.
+      if (fs.existsSync(dirFor(match[1]))) continue
+      // Never remove a group with a live agent on it: a repair in progress is
+      // not ours to delete because the board record moved.
+      try {
+        fs.rmSync(path.join(sessionsRoot, entry.name), { recursive: true, force: true })
+        swept += 1
+      } catch {
+        // Locked; try again next start.
       }
     }
     return swept

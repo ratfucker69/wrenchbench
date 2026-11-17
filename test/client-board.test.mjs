@@ -414,6 +414,21 @@ function textOf(node) {
 
 /* ------------------------------------------------------------------- the test */
 
+/** Walk the rendered element tree for the first node the predicate accepts. */
+function findNode(node, predicate) {
+  if (!node || typeof node !== 'object') return null
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findNode(child, predicate)
+      if (hit) return hit
+    }
+    return null
+  }
+  if (node.props && predicate(node)) return node
+  const children = node.props?.children
+  return children === undefined ? null : findNode(children, predicate)
+}
+
 let tree = null
 
 await check('the panel mounts and reaches a settled state with a board loaded', async () => {
@@ -452,6 +467,25 @@ await check('the schematic upload affordance is present for a board without one'
 await check('the export link is rendered for each board in the library', () => {
   const text = textOf(tree)
   assert.match(text, /export\?id=render-bench-0100/, 'the CSV export link is missing')
+})
+
+await check('the command list is one click away and lists the gestures', async () => {
+  const toggle = findNode(tree, (node) => node.props?.title === 'hints.open')
+  assert.ok(toggle, 'no hint toggle in the panel')
+  assert.equal(toggle.props['aria-expanded'], 'false', 'the list should start closed')
+  toggle.props.onClick()
+  tree = await runtime.mount(panel({}))
+  const text = textOf(tree)
+  for (const key of ['hints.onBoard', 'hints.rightclick', 'hints.legend', 'hints.csv', 'hints.trash', 'hints.onAgent', 'hints.tools']) {
+    assert.match(text, new RegExp(key), `the command list does not show ${key}`)
+  }
+  // The tool names are identifiers, not prose: they must survive translation.
+  assert.match(text, /find · component · net/, 'the tool list is missing')
+  const opened = findNode(tree, (node) => node.props?.title === 'hints.open')
+  assert.equal(opened.props['aria-expanded'], 'true', 'the toggle does not report open state')
+  opened.props.onClick()
+  tree = await runtime.mount(panel({}))
+  assert.doesNotMatch(textOf(tree), /hints\.rightclick/, 'the list cannot be closed again')
 })
 
 await check('the harness surfaces a render fault instead of swallowing it', async () => {

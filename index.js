@@ -1665,7 +1665,9 @@ function createRoutes(ctx, config) {
         // the panel offers.
         const threadId = store.readRepairSession(id)
         const trashed = store.deleteBoard(id)
-        if (trashed) await repairThread.forget(id)
+        // Hand over the thread id read before the delete: the board record goes
+      // with the trash, so a later read would find nothing to clean up.
+      if (trashed) await repairThread.forget(id, threadId?.sessionId ?? null)
         return sendJson(
           res,
           trashed ? 200 : 404,

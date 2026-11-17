@@ -216,6 +216,107 @@ await checkAsync('a sweep drops threads for boards that no longer exist', async 
   assert.ok(!left.includes('orphan-b'), 'an orphaned thread survived')
 })
 
+// A repair thread also leaves a group in the harness session store. The bench
+// once left ten of those behind, which is what a technician sees as an
+// ungrouped session.
+const fakeHome = path.join(os.tmpdir(), `wrenchbench-home-${process.pid}`)
+const sessionsRoot = path.join(fakeHome, '.dsh', 'sessions')
+const groupFor = (id) => path.join(sessionsRoot, `--C-Users-bench-.dsh-wrenchbench-repair-${id}--`)
+const realHome = process.env.USERPROFILE
+const realHomeLower = process.env.HOME
+process.env.USERPROFILE = fakeHome
+process.env.HOME = fakeHome
+fs.mkdirSync(sessionsRoot, { recursive: true })
+
+await checkAsync('forget removes the harness session group even after the board is gone', async () => {
+  await thread.ask('gone-board', 'Gone Board', 'hi')
+  const stored = store.readRepairSession('gone-board')
+  assert.ok(stored?.sessionId, 'the thread id was not recorded')
+  fs.mkdirSync(groupFor('gone-board'), { recursive: true })
+  // Delete the board record first, exactly as the delete route does: the id
+  // must be handed over, or the group is unreachable from the store.
+  store.deleteBoard('gone-board')
+  const removed = await thread.forget('gone-board', stored.sessionId)
+  assert.equal(removed.harnessDirectory, true, 'the session group survived the delete')
+  assert.equal(fs.existsSync(groupFor('gone-board')), false, 'the group is still on disk')
+})
+
+await checkAsync('a sweep drops session groups whose board is gone', () => {
+  fs.mkdirSync(groupFor('sweep-live'), { recursive: true })
+  fs.mkdirSync(groupFor('sweep-dead'), { recursive: true })
+  // Not ours: a group that only looks similar must be left alone.
+  const foreign = path.join(sessionsRoot, '--C-Users-bench-Documents-workspace--')
+  fs.mkdirSync(foreign, { recursive: true })
+  thread.sweep(['sweep-live'])
+  assert.equal(fs.existsSync(groupFor('sweep-live')), true, 'a live board lost its session group')
+  assert.equal(fs.existsSync(groupFor('sweep-dead')), false, 'an orphaned session group survived')
+  assert.equal(fs.existsSync(foreign), true, 'the sweep reached a session that is not ours')
+})
+
+
+await checkAsync('a remembered id the service no longer knows is replaced', async () => {
+  const strict = createRepairThread({
+    ctx: {
+      get: () => ({
+        async create() {
+          return { sessionId: 'fresh-1' }
+        },
+        async rename() {
+          return {}
+        },
+        async inspect(id) {
+          if (id === 'fresh-1') return { events: [] }
+          throw new Error('no such session')
+        },
+        // controller() only accepts a service that can admit a prompt.
+        async prompt() {
+          return { accepted: true }
+        },
+        async list() {
+          return { items: [{ sessionId: 'fresh-1' }] }
+        },
+      }),
+    },
+    root: store.dataRoot,
+    store,
+  })
+  store.writeRepairSession('stale-board', { sessionId: 'gone-forever' })
+  const reconnected = await strict.ensure('stale-board', 'Stale Board')
+  assert.equal(reconnected.created, true, 'the stale id was reused')
+  assert.equal(reconnected.sessionId, 'fresh-1')
+  assert.equal(store.readRepairSession('stale-board')?.sessionId, 'fresh-1', 'the record still holds the dead id')
+})
+
+await checkAsync('a group whose repair directory survives is left alone', () => {
+  const kept = path.join(store.dataRoot, 'repair', 'kept-live')
+  fs.mkdirSync(kept, { recursive: true })
+  fs.mkdirSync(groupFor('kept-live'), { recursive: true })
+  // The listing is empty: the belt-and-braces check is what protects it.
+  thread.sweep([])
+  assert.equal(fs.existsSync(groupFor('kept-live')), true, 'a live repair directory lost its session group')
+})
+
+
+await checkAsync('an empty listing never wipes session groups', () => {
+  fs.mkdirSync(groupFor('listing-lost'), { recursive: true })
+  // An empty array is what a failed library read looks like. It must not be
+  // read as "nothing is live".
+  thread.sweep([])
+  assert.equal(fs.existsSync(groupFor('listing-lost')), true, 'an unreadable library cost a session group')
+})
+
+// A real listing of a live board still leaves its group alone.
+await checkAsync('a real listing keeps the group of a live board', () => {
+  const kept = path.join(store.dataRoot, 'repair', 'listing-live')
+  fs.mkdirSync(kept, { recursive: true })
+  fs.mkdirSync(groupFor('listing-live'), { recursive: true })
+  thread.sweep(['listing-live'])
+  assert.equal(fs.existsSync(groupFor('listing-live')), true, 'a live board lost its session group')
+})
+
+process.env.USERPROFILE = realHome
+process.env.HOME = realHomeLower
+
 console.log('\nfailures are reported, never hidden')
 
 await checkAsync('a missing session service is a clear refusal', async () => {

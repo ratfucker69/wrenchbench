@@ -1330,6 +1330,9 @@ window.__ModuleLoader__.load({
           const [busy, setBusy] = React.useState('')
           const [notice, setNotice] = React.useState('')
           const [tab, setTab] = React.useState('board')
+          // The command list is a memory aid, not a tutorial: closed by default,
+          // one click away, and never in the way of the canvas.
+          const [hintsOpen, setHintsOpen] = React.useState(false)
           const [search, setSearch] = React.useState('')
           const [dragging, setDragging] = React.useState(false)
           const [selection, setSelection] = React.useState({ refdes: null, net: null, pin: null, annotation: null })
@@ -4134,6 +4137,54 @@ window.__ModuleLoader__.load({
                 ),
           )
 
+          const hintLine = (label, detail) =>
+            h(
+              'div',
+              { key: `hint-${label}`, style: { display: 'flex', gap: 6, alignItems: 'baseline', lineHeight: 1.5 } },
+              h('span', { style: { fontSize: 11.5 } }, label),
+              detail ? h('span', { style: { fontSize: 11, color: T.muted } }, detail) : null,
+            )
+
+          // Every gesture the panel answers to, and every tool the agent has, in
+          // one place — written down because nobody remembers a right-click menu
+          // they were told about once.
+          const hintRows = [
+            h('div', { key: 'h-onboard', style: { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: 0.4, color: T.muted } }, t('hints.onBoard')),
+            hintLine(t('hints.rightclick')),
+            hintLine(t('hints.legend')),
+            hintLine(t('hints.colour')),
+            hintLine(t('hints.csv')),
+            hintLine(t('hints.trash')),
+            h('div', { key: 'h-onagent', style: { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: 0.4, color: T.muted, marginTop: 4 } }, t('hints.onAgent')),
+            hintLine(t('hints.plain')),
+            hintLine(t('hints.marks')),
+            h('div', { key: 'h-ontools', style: { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: 0.4, color: T.muted, marginTop: 4 } }, t('hints.tools')),
+            h(
+              'div',
+              { key: 'h-toolnames', style: { fontSize: 10.5, fontFamily: T.mono, color: T.muted, lineHeight: 1.7 } },
+              'find · component · net · search · measure · schematic · focus · mark · label_rail · checks · rail_map · import · enrich · name_part · board · boards',
+            ),
+            h('div', { key: 'h-prefix', style: { fontSize: 10, color: T.muted, marginTop: 2 } }, t('hints.prefix')),
+          ]
+
+          const hintsPane = hintsOpen
+            ? h(
+                'div',
+                {
+                  style: {
+                    border: T.border,
+                    borderRadius: 10,
+                    padding: '9px 10px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 3,
+                    background: 'color-mix(in srgb, currentColor 4%, transparent)',
+                  },
+                },
+                ...hintRows,
+              )
+            : null
+
           const tabButton = (id, label) =>
             h(
               'button',
@@ -4173,12 +4224,41 @@ window.__ModuleLoader__.load({
             },
             h(
               'div',
-              { style: { display: 'flex', gap: 5 } },
+              { style: { display: 'flex', gap: 5, alignItems: 'center' } },
               tabButton('board', t('tab.board')),
               tabButton('triage', t('tab.triage')),
               tabButton('agent', t('tab.agent')),
               tabButton('schematic', t('tab.schematic')),
+              h(
+                'button',
+                {
+                  key: 'hints',
+                  type: 'button',
+                  title: t('hints.open'),
+                  'aria-label': t('hints.open'),
+                  'aria-expanded': hintsOpen ? 'true' : 'false',
+                  onClick: () => setHintsOpen((open) => !open),
+                  style: {
+                    appearance: 'none',
+                    marginLeft: 'auto',
+                    width: 20,
+                    height: 20,
+                    flex: 'none',
+                    border: T.border,
+                    borderRadius: 999,
+                    background: hintsOpen ? 'color-mix(in srgb, currentColor 13%, transparent)' : 'transparent',
+                    color: 'inherit',
+                    fontFamily: 'inherit',
+                    fontSize: 11,
+                    lineHeight: 1,
+                    cursor: 'pointer',
+                    opacity: 0.8,
+                  },
+                },
+                '?',
+              ),
             ),
+            hintsPane,
             tab === 'triage' ? triagePane : tab === 'agent' ? agentPane : tab === 'schematic' ? schematicPane : inspector,
           )
 

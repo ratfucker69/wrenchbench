@@ -182,6 +182,26 @@ try {
   // best effort
 }
 
+// The tour asks real questions, so the host stores a real session for the board
+// it just deleted. Deleting the board forgets the repair thread; the session
+// store groups by working directory, and the group would otherwise stay behind
+// in the user's session list as an orphan. Match by board id, not by rebuilding
+// the store's directory-name rules.
+const home = process.env.USERPROFILE ?? process.env.HOME ?? ''
+const sessionsRoot = path.join(home, '.dsh', 'sessions')
+let swept = 0
+try {
+  for (const entry of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    if (!entry.name.endsWith(`${tempId}--`)) continue
+    fs.rmSync(path.join(sessionsRoot, entry.name), { recursive: true, force: true })
+    swept += 1
+  }
+} catch {
+  // best effort: a missing store is not a tour failure
+}
+check('the tour leaves no session group behind', swept <= 1, `removed ${swept}`)
+
 const slowest = [...timings].sort((a, b) => b.ms - a.ms).slice(0, 5)
 console.log('\ntimings (ms):')
 for (const row of slowest) console.log(`  ${String(row.ms).padStart(6)}  ${row.label}`)
