@@ -853,7 +853,38 @@ window.__ModuleLoader__.load({
           }
         }
 
-        function WrenchBenchPanel() {
+        /**
+     * Identity of one agent focus command.
+     *
+     * The Host bumps `revision` on every /focus write, so re-issuing the same
+     * target counts as a new command, while an unchanged file means the agent
+     * did nothing and the technician's own selection must be left alone.
+     * `updatedAt` is only a fallback for a focus file written by an older Host.
+     */
+    function focusSignature(focus) {
+      if (!focus) return ''
+      return [
+        focus.revision ?? focus.updatedAt ?? '',
+        focus.boardId ?? '',
+        focus.refdes ?? '',
+        focus.net ?? '',
+        focus.pin ?? '',
+        focus.annotation ?? '',
+      ].join('|')
+    }
+
+    function selectionFromFocus(focus) {
+      const hasTarget = Boolean(focus && (focus.refdes || focus.net || focus.pin))
+      if (!hasTarget) return { refdes: null, net: null, pin: null, annotation: null }
+      return {
+        refdes: focus.refdes ?? null,
+        net: focus.net ?? null,
+        pin: focus.pin ?? null,
+        annotation: focus.annotation ?? null,
+      }
+    }
+
+    function WrenchBenchPanel() {
           const [index, setIndex] = React.useState(null)
           const [indexError, setIndexError] = React.useState('')
           const [activeId, setActiveId] = React.useState(null)
@@ -904,6 +935,10 @@ window.__ModuleLoader__.load({
           docRef.current = doc
 
           const panelRef = React.useRef(null)
+          // Which agent focus command this panel has already applied. Without
+          // it, the 2s poll re-applies "no focus" forever and wipes the
+          // technician's own click after a couple of seconds.
+          const appliedFocusRef = React.useRef(null)
 
           React.useEffect(() => {
             let dispose = () => {}
@@ -972,7 +1007,12 @@ window.__ModuleLoader__.load({
                 setObservations(Array.isArray(body.observations) ? body.observations : [])
                 setChecks(body.checks ?? { suspects: [], notes: [] })
                 setAliases(body.aliases && typeof body.aliases === 'object' ? body.aliases : {})
-                setSelection({ refdes: null, net: null, pin: null, annotation: null })
+                // A focus the agent set before this board was opened is still
+                // live, so adopt it now and record it as applied — otherwise
+                // the poll above would replay it on top of the first click.
+                const openingFocus = body.focus && body.focus.boardId === body.meta.id ? body.focus : null
+                appliedFocusRef.current = focusSignature(openingFocus)
+                setSelection(selectionFromFocus(openingFocus))
                 const canvas = canvasRef.current
                 const width = canvas?.clientWidth ?? 0
                 const height = canvas?.clientHeight ?? 0
@@ -1011,19 +1051,16 @@ window.__ModuleLoader__.load({
                   setActiveId(focus.boardId)
                   return
                 }
-                const hasTarget = Boolean(focus.refdes || focus.net || focus.pin)
-                setSelection((previous) => {
-                  if (!hasTarget) return { refdes: null, net: null, pin: null, annotation: null }
-                  if (
-                    previous.refdes === focus.refdes &&
-                    previous.net === focus.net &&
-                    previous.pin === focus.pin &&
-                    previous.annotation === focus.annotation
-                  ) {
-                    return previous
-                  }
-                  return { refdes: focus.refdes, net: focus.net, pin: focus.pin, annotation: focus.annotation }
-                })
+                // Adopt the agent's focus only when it actually issued a new
+                // command. An unchanged focus file means "the agent is not
+                // doing anything", which must never disturb a selection the
+                // technician made by clicking the board — that was the bug
+                // where connected pads vanished after a couple of seconds.
+                const signature = focusSignature(focus)
+                if (signature !== appliedFocusRef.current) {
+                  appliedFocusRef.current = signature
+                  setSelection(selectionFromFocus(focus))
+                }
 
                 const marks = await getJson(`${ROUTE}/observe?id=${encodeURIComponent(current.meta.id)}`)
                 if (!alive || !marks) return

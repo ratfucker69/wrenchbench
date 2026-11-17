@@ -255,6 +255,10 @@ export function writeFocus(patch) {
     net: patch.net === undefined ? current.net : patch.net,
     pin: patch.pin === undefined ? current.pin : patch.pin,
     annotation: patch.annotation === undefined ? current.annotation : patch.annotation,
+    // Monotonic, so a panel can tell "the agent just re-pointed at the same
+    // part" from "the agent has done nothing since I last looked". A timestamp
+    // is not enough: two writes in the same millisecond compare equal.
+    revision: (Number(current.revision) || 0) + 1,
     updatedAt: new Date().toISOString(),
   }
   writeAtomic(focusFile, JSON.stringify(next))
