@@ -1354,6 +1354,9 @@ window.__ModuleLoader__.load({
           const [schematicQuery, setSchematicQuery] = React.useState('')
           const [askText, setAskText] = React.useState('')
           const [askState, setAskState] = React.useState({ status: 'idle', message: '', sessionId: null })
+          // The repair conversation lives in WrenchBench's own session, not in
+          // the workspace list, so the panel draws it here.
+          const [thread, setThread] = React.useState({ messages: [], running: false, sessionId: null, unavailable: null })
           const [ui, setUi] = React.useState({
             showComponents: true,
             showPads: true,
@@ -1797,6 +1800,38 @@ window.__ModuleLoader__.load({
             [activeId, rails],
           )
 
+          const threadEndRef = React.useRef(null)
+          // Keep the newest line in view while an answer streams in.
+          React.useEffect(() => {
+            const node = threadEndRef.current
+            if (node && typeof node.scrollIntoView === 'function') node.scrollIntoView({ block: 'end' })
+          }, [thread.messages.length, thread.running])
+
+          const loadThread = React.useCallback(async (boardId) => {
+            if (!boardId) return
+            try {
+              const body = await getJson(`${ROUTE}/conversation?id=${encodeURIComponent(boardId)}`)
+              setThread({
+                messages: Array.isArray(body?.messages) ? body.messages : [],
+                running: body?.running === true,
+                sessionId: body?.sessionId ?? null,
+                unavailable: body?.unavailable ?? null,
+              })
+            } catch (error) {
+              setThread((existing) => ({ ...existing, unavailable: error instanceof Error ? error.message : String(error) }))
+            }
+          }, [])
+
+          // Refreshed while the Agent tab is open: a short repair thread is a
+          // few messages, and polling keeps one code path instead of a second
+          // stream to keep in sync.
+          React.useEffect(() => {
+            if (!activeId || tab !== 'agent') return undefined
+            loadThread(activeId)
+            const timer = setInterval(() => loadThread(activeId), 2500)
+            return () => clearInterval(timer)
+          }, [activeId, tab, loadThread])
+
           // --- ask the agent -------------------------------------------------
           const askAgent = React.useCallback(async () => {
             const question = askText.trim()
@@ -1811,22 +1846,35 @@ window.__ModuleLoader__.load({
               if (body?.accepted) {
                 setAskState({ status: 'sent', message: '', sessionId: body.sessionId ?? null })
                 setAskText('')
+                // Draw the question immediately rather than after the next poll.
+                setThread((existing) => ({
+                  ...existing,
+                  sessionId: body.sessionId ?? existing.sessionId,
+                  messages: [...existing.messages, { role: 'user', text: question, time: Date.now() }],
+                }))
+                loadThread(activeId)
               } else {
-                setAskState({ status: 'no-session', message: body?.reason ?? '', sessionId: null })
+                setAskState({
+                  status: 'no-session',
+                  message: body?.detail || body?.reason || '',
+                  sessionId: null,
+                })
               }
             } catch (error) {
               setAskState({ status: 'error', message: error instanceof Error ? error.message : String(error), sessionId: null })
             }
-          }, [askText, activeId, selection.refdes])
+          }, [askText, activeId, selection.refdes, loadThread])
 
-          const openConversation = React.useCallback(() => {
+          const newThread = React.useCallback(async () => {
+            if (!activeId) return
             try {
-              const layout = ctx.get('layout')
-              if (layout && typeof layout.selectPanel === 'function') layout.selectPanel('conversation')
-            } catch {
-              // Navigation is best-effort.
+              const body = await sendJson(`${ROUTE}/conversation/new?id=${encodeURIComponent(activeId)}`, 'POST', {})
+              setThread({ messages: [], running: false, sessionId: body?.sessionId ?? null, unavailable: null })
+              setAskState({ status: 'idle', message: '', sessionId: null })
+            } catch (error) {
+              setAskState({ status: 'error', message: error instanceof Error ? error.message : String(error), sessionId: null })
             }
-          }, [])
+          }, [activeId])
 
           // --- pointer interactions ------------------------------------------
           // A native listener, because React's delegated wheel handler is
@@ -3756,7 +3804,90 @@ window.__ModuleLoader__.load({
           const agentPane = h(
             'div',
             { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, flex: 1 } },
-            h('div', { style: { fontSize: 11.5, color: T.muted, lineHeight: 1.5 } }, t('agent.hint')),
+            h(
+              'div',
+              {
+                style: {
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 6,
+                  fontSize: 10.5,
+                  color: T.muted,
+                  letterSpacing: 0.3,
+                  textTransform: 'uppercase',
+                },
+              },
+              h('span', null, t('agent.thread')),
+              h(
+                'button',
+                { type: 'button', onClick: newThread, style: { ...BUTTON, padding: '2px 7px', fontSize: 10 } },
+                t('agent.newThread'),
+              ),
+            ),
+            // The conversation is WrenchBench's own session, drawn here so the
+            // technician never sees a workspace chat for a bench question.
+            h(
+              'div',
+              {
+                style: {
+                  flex: 1,
+                  minHeight: 120,
+                  maxHeight: 340,
+                  overflowY: 'auto',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 7,
+                  padding: '2px 1px',
+                },
+              },
+              thread.unavailable
+                ? h('div', { style: { fontSize: 11.5, color: T.danger } }, thread.unavailable)
+                : null,
+              thread.messages.length === 0
+                ? h('div', { style: { fontSize: 11.5, color: T.muted, lineHeight: 1.5 } }, t('agent.empty'))
+                : thread.messages.map((message, index) =>
+                    message.role === 'tool'
+                      ? h(
+                          'div',
+                          { key: `m${index}`, style: { fontSize: 10, color: T.muted, fontFamily: T.mono } },
+                          `· ${message.text}`,
+                        )
+                      : h(
+                          'div',
+                          {
+                            key: `m${index}`,
+                            style:
+                              message.role === 'user'
+                                ? {
+                                    alignSelf: 'flex-end',
+                                    maxWidth: '88%',
+                                    fontSize: 12,
+                                    lineHeight: 1.45,
+                                    padding: '5px 8px',
+                                    borderRadius: 9,
+                                    background: 'color-mix(in srgb, currentColor 7%, transparent)',
+                                    border: T.border,
+                                    whiteSpace: 'pre-wrap',
+                                  }
+                                : {
+                                    alignSelf: 'flex-start',
+                                    maxWidth: '94%',
+                                    fontSize: 12,
+                                    lineHeight: 1.5,
+                                    paddingLeft: 7,
+                                    borderLeft: `2px solid ${T.brand}`,
+                                    whiteSpace: 'pre-wrap',
+                                  },
+                          },
+                          message.text,
+                        ),
+                  ),
+              thread.running
+                ? h('div', { style: { fontSize: 10.5, color: T.muted, fontFamily: T.mono } }, t('agent.thinking'))
+                : null,
+              h('div', { ref: threadEndRef }),
+            ),
             h('textarea', {
               value: askText,
               onChange: (event) => setAskText(event.currentTarget.value),
@@ -3801,16 +3932,7 @@ window.__ModuleLoader__.load({
                 : null,
             ),
             askState.status === 'sent'
-              ? h(
-                  'div',
-                  { style: { display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12, color: T.muted } },
-                  h('div', null, t('agent.sent')),
-                  h(
-                    'button',
-                    { type: 'button', style: { ...BUTTON, alignSelf: 'flex-start' }, onClick: openConversation },
-                    t('agent.openConversation'),
-                  ),
-                )
+              ? h('div', { style: { fontSize: 11, color: T.muted } }, t('agent.sent'))
               : null,
             askState.status === 'no-session'
               ? h('div', { style: { fontSize: 12, color: T.muted } }, t('agent.noSession'))

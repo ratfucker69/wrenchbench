@@ -1,6 +1,6 @@
 {
   "name": "dsh-wrenchbench",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "WrenchBench: a board-level repair workbench in the sidebar - boardview import and canvas, per-board schematic ingestion that names anonymous rails by pin-count fingerprint, a persistent board library, and agent tools that read the same board the canvas shows.",
   "type": "module",

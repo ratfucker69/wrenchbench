@@ -22,6 +22,7 @@ import { pagesForToken, searchSchematic } from './pdf-text.js'
 import { extractSchematic } from './schematic.js'
 import { assignComponentRails, classifyRails, deriveRailAliases, ensureLabelledRails, formatVoltage, voltageOf } from './rails.js'
 import { matchSchematicRails } from './schematic-rails.js'
+import { createRepairThread } from './repair-session.js'
 import { classifyParts, displayRefdes, isPlaceholderRefdes, planNaming } from './naming.js'
 import { resolveQuery } from './resolve.js'
 import { nextChecks } from './diagnose.js'
@@ -1508,6 +1509,8 @@ function createRoutes(ctx, config) {
   const maxFileBytes = Number(config?.maxFileBytes) > 0 ? Number(config.maxFileBytes) : DEFAULT_MAX_FILE_BYTES
   const maxPdfBytes = Number(config?.maxPdfBytes) > 0 ? Number(config.maxPdfBytes) : DEFAULT_MAX_PDF_BYTES
   const routes = []
+  // One repair thread per board, owned here and drawn by the panel.
+  const repairThread = createRepairThread({ ctx, root: store.dataRoot, store })
 
   // --- library listing -----------------------------------------------------
   routes.push({
@@ -1920,7 +1923,12 @@ function createRoutes(ctx, config) {
     },
   })
 
-  // --- ask the agent -------------------------------------------------------
+  // --- the repair conversation --------------------------------------------
+  //
+  // WrenchBench owns its own session per board. The panel draws that thread
+  // itself, so a bench conversation never turns up in the workspace session
+  // list — the technician sees one program with an Ask box, and the agent is
+  // still the same agent, tools and model as anywhere else.
   routes.push({
     kind: 'exact',
     path: `${ROUTE}/ask`,
@@ -1932,85 +1940,56 @@ function createRoutes(ctx, config) {
         if (question.length === 0) return fail(res, 400, 'a question is required')
 
         const loaded = loadBoard(body.board)
-        const context = []
-        if (!loaded.error) {
-          const { meta, board } = loaded
-          context.push(`[WrenchBench] board on the canvas: ${meta.name} [${meta.id}] — ${board.stats.parts} components, ${board.stats.pins} pads, ${board.stats.nets} nets (${meta.format}).`)
-          const focus = store.readFocus()
-          const focused = [focus?.refdes, focus?.net ? `net ${focus.net}` : null, focus?.pin ? `pin ${focus.pin}` : null].filter(Boolean)
-          if (focused.length > 0) context.push(`[WrenchBench] current canvas focus: ${focused.join(', ')}.`)
-          if (body.refdes) context.push(`[WrenchBench] the technician is pointing at ${String(body.refdes).toUpperCase()}.`)
-          const schematic = store.readSchematic(meta.id)
-          context.push(
-            schematic
-              ? `[WrenchBench] schematic attached: ${schematic.name}, ${schematic.stats.pages} pages.`
-              : '[WrenchBench] no schematic PDF is attached to this board.',
-          )
-          context.push(
-            'Answer from the wrenchbench_* tools (wrenchbench_component, wrenchbench_net, wrenchbench_search, wrenchbench_schematic, wrenchbench_focus) rather than from memory. Never name a refdes without checking it first.',
-          )
-        }
+        if (loaded.error) return fail(res, 404, loaded.error)
+        const { meta } = loaded
 
-        const text = [...context, '', question].join('\n')
-
-        // The prompt is admitted into the live session so the answer lands in
-        // the conversation the technician already has open. Prefer the most
-        // recently registered root agent, which is the one on screen.
-        const agents = ctx.get('agents')
-        const controller = ctx.get('sessionController')
-        if (!agents || !controller) {
-          return sendJson(res, 503, {
-            accepted: false,
-            reason: 'no-session',
-            detail: 'The agent services are not available in this profile.',
-          })
-        }
-
-        // Roots first, then any live agent: a resumed session is still a root,
-        // but a host with only child agents would otherwise report no session.
-        let candidates = []
-        if (typeof agents.roots === 'function') candidates = agents.roots()
-        if (candidates.length === 0 && typeof agents.list === 'function') candidates = agents.list()
-        const target = candidates.length > 0 ? candidates[candidates.length - 1] : undefined
-        if (!target) {
+        const answer = await repairThread.ask(meta.id, meta.name, question)
+        if (!answer.accepted) {
           return sendJson(res, 200, {
             accepted: false,
-            reason: 'no-session',
-            detail: 'No agent session is live. Send a message in the chat first, then ask from the panel.',
+            reason: answer.reason,
+            detail: answer.detail ?? null,
+            sessionId: answer.sessionId ?? null,
           })
         }
-
-        // The admission call requires a live AbortSignal — it calls
-        // signal.throwIfAborted() before queueing, so omitting one throws and
-        // the whole request failed with a bare 500. Time-boxed so a wedged
-        // admission cannot hang the panel.
-        const abort = new AbortController()
-        const timer = setTimeout(() => abort.abort(), 20000)
-        try {
-          await controller.prompt(
-            {
-              requestId: `wrenchbench-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-              sessionId: target.id,
-              mode: 'queue',
-              content: [{ type: 'text', text }],
-            },
-            abort.signal,
-          )
-        } catch (error) {
-          const code = error?.code ?? error?.name ?? 'prompt-failed'
-          return sendJson(res, 200, {
-            accepted: false,
-            reason: String(code),
-            detail: error instanceof Error ? error.message : String(error),
-          })
-        } finally {
-          clearTimeout(timer)
-        }
-
-        return sendJson(res, 200, { accepted: true, sessionId: String(target.id), composed: text })
+        return sendJson(res, 200, { accepted: true, sessionId: answer.sessionId })
       } catch (error) {
         return fail(res, 500, error instanceof Error ? error.message : String(error))
       }
+    },
+  })
+
+  routes.push({
+    kind: 'exact',
+    path: `${ROUTE}/conversation`,
+    handler: async (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const id = url.searchParams.get('id') ?? ''
+      if (!store.isBoardId(id)) return fail(res, 400, 'a valid board id is required')
+      const meta = store.readMeta(id)
+      if (!meta) return fail(res, 404, 'that board is not in the library')
+      try {
+        const thread = await repairThread.conversation(id, meta.name)
+        return sendJson(res, 200, thread)
+      } catch (error) {
+        return fail(res, 500, error instanceof Error ? error.message : String(error))
+      }
+    },
+  })
+
+  routes.push({
+    kind: 'exact',
+    path: `${ROUTE}/conversation/new`,
+    handler: async (req, res) => {
+      if (req.method !== 'POST') return fail(res, 405, 'method not allowed')
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const id = url.searchParams.get('id') ?? ''
+      if (!store.isBoardId(id)) return fail(res, 400, 'a valid board id is required')
+      const meta = store.readMeta(id)
+      if (!meta) return fail(res, 404, 'that board is not in the library')
+      const made = await repairThread.reset(id, meta.name)
+      if (made.error) return sendJson(res, 200, { reset: false, reason: made.error, detail: made.detail ?? null })
+      return sendJson(res, 200, { reset: true, sessionId: made.sessionId, messages: [] })
     },
   })
 

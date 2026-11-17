@@ -92,6 +92,10 @@ function railMapFile(id) {
   return path.join(boardDir(id), 'railmap.json')
 }
 
+function repairSessionFile(id) {
+  return path.join(boardDir(id), 'repair.json')
+}
+
 function aliasesFile(id) {
   return path.join(boardDir(id), 'aliases.json')
 }
@@ -413,6 +417,28 @@ export function readRailMap(id) {
   if (!isBoardId(id)) return null
   const stored = readJson(railMapFile(id))
   return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : null
+}
+
+/**
+ * The repair thread this board's questions are asked in.
+ *
+ * Remembered per board so a bench conversation survives a restart. The session
+ * itself lives outside the workspace, which is what keeps it out of the
+ * workspace session list.
+ *
+ * @returns {{sessionId: string, name: string|null, at: string}|null}
+ */
+export function readRepairSession(id) {
+  if (!isBoardId(id)) return null
+  const stored = readJson(repairSessionFile(id))
+  return stored && typeof stored === 'object' && typeof stored.sessionId === 'string' ? stored : null
+}
+
+/** Remember the repair thread for one board. */
+export function writeRepairSession(id, value) {
+  if (!isBoardId(id)) return null
+  writeAtomic(repairSessionFile(id), JSON.stringify(value ?? {}, null, 2))
+  return value
 }
 
 /** Replace the stored rail match for one board. */

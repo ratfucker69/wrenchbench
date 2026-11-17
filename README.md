@@ -56,6 +56,16 @@ If your setup has no `dsh` CLI on `PATH`, add the package to your profile instea
 
 Nothing leaves the machine. The library lives in `%APPDATA%/dsh-wrenchbench` (`~/.local/share/dsh-wrenchbench` on Linux).
 
+## The repair session
+
+Repair questions do not run in a workspace conversation. WrenchBench owns one session per board:
+
+- it is created in `~/.dsh/wrenchbench/repair/<board-id>`, so the workspace session list has nothing to show;
+- its id is remembered in the board's own record, so a repair thread survives a restart;
+- the panel draws the transcript itself (question, answer, and the tools the agent used), which is why the Ask tab is the only place a bench conversation appears.
+
+The agent is the same agent loop, tools and model as anywhere else — only the session is separate. The reply context (board, rail groups with their voltages, marks, canvas focus) reaches it through the system prompt, so the technician's own words go in verbatim and come back exactly as drawn. Harness scaffolding — runtime-context blocks, skill notices, checkpoint messages — is filtered out of the transcript rather than shown as if they had typed it.
+
 ## Naming rails from the schematic
 
 A vendor boardview calls every net `Net72`, and its designators (`C00173`, `N16136`) share no namespace with the schematic's (`C1027`, `IC4001`). Name-matching and refdes-matching across the two files are therefore both impossible, and guessing a voltage from fan-out would put a technician on the wrong rail.
@@ -106,6 +116,8 @@ Every applied name stores its evidence (page, pin count, pad count, the uniquene
 | `wrenchbench_focus` | move the canvas focus the technician is looking at |
 | `wrenchbench_label_rail` | give an anonymous net its real rail name (overrides a schematic match) |
 | `wrenchbench_rail_map` | show how each opaque net got its name, and which rails are still an open choice |
+
+The panel's Ask tab talks to a WrenchBench-owned repair session, not to the workspace chat; see [The repair session](#the-repair-session).
 | `wrenchbench_name_part` / `wrenchbench_enrich` | confirm a part name, re-run the naming pass |
 
 ## Tests

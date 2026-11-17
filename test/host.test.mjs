@@ -272,26 +272,46 @@ expect(
 const wrongMethod = await call('/api/dsh-wrenchbench/import', { method: 'GET', url: '/api/dsh-wrenchbench/import' })
 expect('a wrong method is refused', wrongMethod.status === 405, String(wrongMethod.status))
 
-// --- asking the agent ------------------------------------------------------
+// --- the repair conversation ----------------------------------------------
 //
-// This route shipped broken once: it called sessionController.prompt() without
-// the AbortSignal the admission contract requires, the service threw, and the
-// panel showed nothing usable. The fakes below are deliberately strict — the
-// controller refuses a call without a signal, exactly like the real one.
-console.log('\n# ask the agent')
+// The bench conversation is WrenchBench's own session: created outside the
+// workspace, asked in the technician's own words, and read back by the panel.
+// The fakes are strict about the contract that broke once — prompt() without an
+// AbortSignal.
+console.log('\n# the repair conversation')
 
-const prompts = []
-services.agents = { roots: () => [{ id: 'session-1' }] }
-services.sessionController = {
-  async prompt(request, signal) {
-    // Same guard the real service runs before admitting anything.
-    const check = signal?.throwIfAborted
-    if (typeof check !== 'function') throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
-    check.call(signal)
-    prompts.push({ request, aborted: signal.aborted })
-    return { accepted: true }
-  },
+const sessions = { made: [], prompts: [], renamed: [], events: [] }
+let created = 0
+function workingController() {
+  return {
+    async create(request) {
+      created += 1
+      const sessionId = `wb-${created}`
+      sessions.made.push({ sessionId, ...request })
+      return { sessionId }
+    },
+    async rename(request) {
+      sessions.renamed.push(request)
+      return { title: request.title, seq: 1 }
+    },
+    async prompt(request, signal) {
+      if (typeof signal?.throwIfAborted !== 'function') {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
+      }
+      signal.throwIfAborted()
+      sessions.prompts.push(request)
+      sessions.events.push({ type: 'user/message', time: Date.now(), data: { role: 'user', content: request.content } })
+      return { accepted: true }
+    },
+    async inspect() {
+      return { events: sessions.events }
+    },
+    async list() {
+      return { items: [{ sessionId: `wb-${created}`, running: false }] }
+    },
+  }
 }
+services.sessionController = workingController()
 
 const asked = await call('/api/dsh-wrenchbench/ask', {
   method: 'POST',
@@ -300,24 +320,75 @@ const asked = await call('/api/dsh-wrenchbench/ask', {
   headers: { 'content-type': 'application/json' },
 })
 expect(
-  'a question is admitted into the live session',
-  asked.status === 200 && asked.json?.accepted === true && asked.json?.sessionId === 'session-1',
+  'a question opens a repair session of its own',
+  asked.status === 200 && asked.json?.accepted === true && asked.json?.sessionId === 'wb-1',
   `${asked.status} ${asked.text.slice(0, 200)}`,
 )
-expect('the prompt carries a live AbortSignal', prompts.length === 1 && prompts[0].aborted === false, JSON.stringify(prompts))
+const sessionDir = sessions.made[0]?.cwd ?? ''
 expect(
-  'the prompt names the board on the canvas',
-  /board on the canvas/.test(prompts[0]?.request?.content?.[0]?.text ?? ''),
-  (prompts[0]?.request?.content?.[0]?.text ?? '').slice(0, 160),
+  'that session lives outside the workspace',
+  sessionDir.includes('repair') && !/default-workspace/i.test(sessionDir),
+  sessionDir,
 )
 expect(
-  'the question is queued rather than steered',
-  prompts[0]?.request?.mode === 'queue' && typeof prompts[0]?.request?.requestId === 'string',
-  JSON.stringify(prompts[0]?.request?.mode),
+  'the session is named for the board',
+  sessions.renamed[0]?.title === 'WrenchBench — ' + store.readMeta(boardId).name,
+  JSON.stringify(sessions.renamed[0] ?? null),
+)
+expect(
+  'the question is admitted verbatim, with no context lines mixed in',
+  sessions.prompts[0]?.content?.length === 1 &&
+    sessions.prompts[0].content[0].text === 'is Net72 shorted to ground?' &&
+    !/\[WrenchBench\]/.test(sessions.prompts[0].content[0].text),
+  JSON.stringify(sessions.prompts[0]?.content ?? null),
 )
 
-// A rejection has to reach the panel with its reason, not as a bare 500.
+// The panel reads the answer back through the same route it draws from.
+sessions.events.push({
+  type: 'tool/call',
+  time: Date.now(),
+  data: { name: 'wrenchbench_net' },
+})
+sessions.events.push({
+  type: 'assistant/message',
+  time: Date.now(),
+  data: { message: { content: [{ type: 'text', text: '1.35 V — VMEMIO, 1276 pads.' }] } },
+})
+const conversation = await call('/api/dsh-wrenchbench/conversation', { url: `/api/dsh-wrenchbench/conversation?id=${boardId}` })
+const messages = conversation.json?.messages ?? []
+expect(
+  'the conversation reads back as what the technician sees',
+  messages.length === 3 &&
+    messages[0].role === 'user' &&
+    messages[1].role === 'tool' &&
+    messages[1].text === 'wrenchbench_net' &&
+    messages[2].role === 'assistant' &&
+    /VMEMIO/.test(messages[2].text),
+  JSON.stringify(messages).slice(0, 300),
+)
+expect('the thread reports whether an answer is still coming', conversation.json?.running === false, JSON.stringify(conversation.json))
+
+const secondAsk = await call('/api/dsh-wrenchbench/ask', {
+  method: 'POST',
+  url: '/api/dsh-wrenchbench/ask',
+  body: JSON.stringify({ question: 'and Net73?', board: boardId }),
+  headers: { 'content-type': 'application/json' },
+})
+expect('a follow-up reuses the same thread', secondAsk.json?.sessionId === 'wb-1', secondAsk.text.slice(0, 160))
+
+const reset = await call('/api/dsh-wrenchbench/conversation/new', {
+  method: 'POST',
+  url: `/api/dsh-wrenchbench/conversation/new?id=${boardId}`,
+  body: '{}',
+  headers: { 'content-type': 'application/json' },
+})
+expect('a new session replaces the thread', reset.json?.reset === true && reset.json?.sessionId === 'wb-2', reset.text.slice(0, 160))
+
+// A refusal has to reach the panel with its reason, not as a bare 500.
 services.sessionController = {
+  async create() {
+    return { sessionId: 'wb-9' }
+  },
   async prompt() {
     const error = new Error('another writer holds this session')
     error.code = 'session/writer-held'
@@ -332,49 +403,25 @@ const refused = await call('/api/dsh-wrenchbench/ask', {
 })
 expect(
   'a refused admission comes back with its reason',
-  refused.status === 200 &&
-    refused.json?.accepted === false &&
-    refused.json?.reason === 'session/writer-held' &&
-    /writer holds/.test(refused.json?.detail ?? ''),
-  `${refused.status} ${refused.text.slice(0, 200)}`,
+  refused.json?.accepted === false && refused.json?.reason === 'session/writer-held' && /writer holds/.test(refused.json?.detail ?? ''),
+  refused.text.slice(0, 200),
 )
 
-// No live agent at all is a normal state early in a session, not an error.
-services.agents = { roots: () => [] , list: () => [] }
-const noSession = await call('/api/dsh-wrenchbench/ask', {
-  method: 'POST',
-  url: '/api/dsh-wrenchbench/ask',
-  body: JSON.stringify({ question: 'ping', board: boardId }),
-  headers: { 'content-type': 'application/json' },
-})
-expect(
-  'no live session is reported as such, with a next step',
-  noSession.json?.accepted === false && noSession.json?.reason === 'no-session' && /Send a message/.test(noSession.json?.detail ?? ''),
-  noSession.text.slice(0, 200),
-)
-
-// A live child agent (no roots) must still receive the question.
-services.sessionController = {
-  async prompt(request, signal) {
-    signal?.throwIfAborted?.()
-    prompts.push({ request })
-    return { accepted: true }
-  },
-}
-services.agents = { roots: () => [], list: () => [{ id: 'child-9' }] }
-const childAsk = await call('/api/dsh-wrenchbench/ask', {
-  method: 'POST',
-  url: '/api/dsh-wrenchbench/ask',
-  body: JSON.stringify({ question: 'ping', board: boardId }),
-  headers: { 'content-type': 'application/json' },
-})
-expect(
-  'a live child agent is a valid target when no root is registered',
-  childAsk.json?.sessionId === 'child-9',
-  childAsk.text.slice(0, 160),
-)
-delete services.agents
+// No service at all is reported plainly rather than posting into the workspace.
 delete services.sessionController
+const noService = await call('/api/dsh-wrenchbench/ask', {
+  method: 'POST',
+  url: '/api/dsh-wrenchbench/ask',
+  body: JSON.stringify({ question: 'ping', board: boardId }),
+  headers: { 'content-type': 'application/json' },
+})
+expect(
+  'without a session service the panel says so',
+  noService.json?.accepted === false && noService.json?.reason === 'no-session-service',
+  noService.text.slice(0, 200),
+)
+
+
 
 console.log('\n# cleanup')
 const deleted = await call('/api/dsh-wrenchbench/board', {

@@ -97,10 +97,34 @@ console.log('\n# enrichment')
 const enriched = await post(`/enrich?id=${boardId}`, {})
 check('enrichment runs and reports rail names', /Rail names: 5/.test(enriched.json?.text ?? ''), (enriched.json?.text ?? '').slice(0, 300))
 
-console.log('\n# asking the agent')
-const asked = await post('/ask', { question: 'smoke test — what is Net73?', board: boardId })
-check('the ask bar is accepted', asked.json?.accepted === true && typeof asked.json?.sessionId === 'string', asked.text.slice(0, 240))
-check('the prompt carries the board context', /board on the canvas/.test(asked.json?.composed ?? ''), (asked.json?.composed ?? '').slice(0, 160))
+console.log('\n# the repair conversation')
+const asked = await post('/ask', { question: 'which rail is Net73?', board: boardId })
+check(
+  'the ask bar is accepted into a repair session',
+  asked.json?.accepted === true && typeof asked.json?.sessionId === 'string',
+  asked.text.slice(0, 240),
+)
+// The user message lands when the turn starts, so give the agent a moment.
+let conversation = await get(`/conversation?id=${boardId}`)
+for (let attempt = 0; attempt < 12; attempt += 1) {
+  const messages = conversation.json?.messages ?? []
+  if (messages.some((message) => message.role === 'user' && /which rail is Net73/.test(message.text))) break
+  await new Promise((resolve) => setTimeout(resolve, 700))
+  conversation = await get(`/conversation?id=${boardId}`)
+}
+check('the panel can read the conversation back', conversation.status === 200 && Array.isArray(conversation.json?.messages), conversation.text.slice(0, 200))
+check(
+  "the question is in the transcript in the technician's words",
+  (conversation.json?.messages ?? []).some((message) => message.role === 'user' && /which rail is Net73/.test(message.text)),
+  JSON.stringify(conversation.json?.messages ?? []).slice(0, 240),
+)
+check(
+  'harness scaffolding is not drawn as if the technician typed it',
+  !(conversation.json?.messages ?? []).some(
+    (message) => message.role === 'user' && /^(Current runtime context|Time sampled while|<system-reminder)/.test(message.text),
+  ),
+  JSON.stringify(conversation.json?.messages ?? []).slice(0, 240),
+)
 const emptyAsk = await post('/ask', { question: '   ', board: boardId })
 check('an empty question is refused', emptyAsk.status === 400, emptyAsk.status)
 
