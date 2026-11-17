@@ -1,0 +1,19 @@
+# Node
+node_modules/
+*.log
+npm-debug.log*
+
+# Test and library state — never commit a user's boards
+library/
+*.test-tmp/
+test/tmp/
+
+# Local scratch
+.DS_Store
+Thumbs.db
+*.local
+.env
+.env.*
+
+# Build output
+dist/

@@ -1,0 +1,25 @@
+# WrenchBench bundle patch.
+#
+# One Host row owns:
+#   - the boardview parsers and the on-disk board library
+#   - the read/write routes under /api/dsh-wrenchbench
+#   - the wrenchbench_* agent tools
+#
+# The packaged Client half adds the sidebar entry plus the matching main panel,
+# and both halves read the same library state, so the agent and the canvas
+# never disagree about which board is loaded.
+- insert:
+    - id: dsh-wrenchbench
+      name: 'dsh-wrenchbench'
+      config:
+        # Board coordinates in the ASCII boardview family are unitless bench
+        # units (the classic OpenBoardView convention is 1/1000 inch). This
+        # only affects the mm estimate reported by wrenchbench_measure.
+        mmPerUnit: 0.0254
+        # Largest boardview file accepted through the panel or an import. An
+        # archive is measured before it is unpacked, so the ceiling applies to
+        # the upload rather than to the board inside it.
+        maxFileBytes: 33554432
+        # Largest schematic accepted for text extraction: a PDF with a text
+        # layer, a plain-text BOM, or a zip holding either.
+        maxPdfBytes: 67108864
