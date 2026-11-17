@@ -3058,7 +3058,7 @@ window.__ModuleLoader__.load({
                                 // Where the name came from. A schematic match is
                                 // arithmetic, not a label someone typed, so it says so
                                 // and carries the counts that produced it.
-                                rail.labelSource === 'schematic'
+                                rail.labelSource === 'schematic' || rail.labelSource === 'prior-board'
                                   ? h(
                                       'span',
                                       {
@@ -3074,7 +3074,7 @@ window.__ModuleLoader__.load({
                                           padding: '0 3px',
                                         },
                                       },
-                                      t('rail.schematicTag'),
+                                      rail.labelSource === 'prior-board' ? t('rail.priorTag') : t('rail.schematicTag'),
                                     )
                                   : null,
                               ),
@@ -3086,8 +3086,16 @@ window.__ModuleLoader__.load({
                           .map((entry, index) => {
                             // Stored by the host, but never assume its shape: a
                             // malformed entry must not blank the pane.
-                            const net = Array.isArray(entry?.nets) ? entry.nets[0] : null
-                            const supplies = Array.isArray(entry?.supplies) ? entry.supplies : []
+                            const net = Array.isArray(entry?.nets)
+                              ? entry.nets[0]
+                              : typeof entry?.net === 'string'
+                                ? entry.net
+                                : null
+                            const supplies = Array.isArray(entry?.choices)
+                              ? entry.choices
+                              : Array.isArray(entry?.supplies)
+                                ? entry.supplies
+                                : []
                             if (!net) return null
                             return h(
                               'div',
@@ -3095,7 +3103,14 @@ window.__ModuleLoader__.load({
                                 key: `open-${index}`,
                                 style: { marginTop: 5, paddingTop: 4, borderTop: T.border, color: T.muted },
                               },
-                              h('div', { style: { fontFamily: T.mono, fontSize: 10 } }, `${net} · ${entry.count}p`),
+                              h(
+                                'div',
+                                { style: { fontFamily: T.mono, fontSize: 10 } },
+                                `${net}${entry.count ? ` · ${entry.count}p` : ''}`,
+                              ),
+                              entry.reason
+                                ? h('div', { style: { fontSize: 9.5, lineHeight: 1.35 } }, entry.reason)
+                                : null,
                               h(
                                 'div',
                                 { style: { display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 2 } },

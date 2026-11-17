@@ -22,6 +22,8 @@ import { pagesForToken, searchSchematic } from './pdf-text.js'
 import { extractSchematic } from './schematic.js'
 import { assignComponentRails, classifyRails, deriveRailAliases, ensureLabelledRails, formatVoltage, voltageOf } from './rails.js'
 import { matchSchematicRails } from './schematic-rails.js'
+import { netSignature, planRailNames, labelEntriesFor, railVocabulary } from './rail-naming.js'
+import { createRailLibrary } from './rail-library.js'
 import { createRepairThread } from './repair-session.js'
 import { classifyParts, displayRefdes, isPlaceholderRefdes, planNaming } from './naming.js'
 import { resolveQuery } from './resolve.js'
@@ -232,6 +234,15 @@ function boardSummaryLine(meta, board) {
   }`
 }
 
+/**
+ * What the bench has learned about rails on every board it has seen.
+ *
+ * Module-level because enrichment (and therefore naming) runs outside the
+ * plugin's activation scope, and the library is a property of the bench, not of
+ * one route.
+ */
+const railLibrary = createRailLibrary(store.dataRoot)
+
 /** Cache of schematic-derived rail aliases, keyed by what they were built from. */
 const aliasCache = new Map()
 
@@ -380,46 +391,77 @@ function enrichBoard(id) {
  * A label the technician already typed is never touched. Anything the counts
  * cannot separate is written down as an open choice, not as a name.
  */
-function nameRailsFromSchematic(id, board, schematic) {
-  let match
+function nameRailsFromSchematic(id, board, schematic, boardName) {
+  const labels = store.readRailLabels(id)
+  let plan
   try {
-    match = matchSchematicRails(board, schematic)
+    plan = planRailNames({ board, schematic, labels, library: railLibrary.all() })
   } catch (error) {
     return { applied: 0, kept: 0, ambiguous: 0, error: String(error?.message ?? error) }
   }
 
-  const labels = store.readRailLabels(id)
   let applied = 0
   let kept = 0
-  for (const assignment of match.assignments) {
-    const prior = labels[assignment.net]
+  for (const entry of labelEntriesFor(plan.applied)) {
+    const prior = labels[entry.net]
+    // A bench label is first-hand evidence and is never overwritten; the same
+    // is true of a name the technician already confirmed from a suggestion.
     if (prior?.label && prior.source !== 'schematic') {
       kept += 1
       continue
     }
-    store.setRailLabel(id, assignment.net, assignment.rail, {
-      source: 'schematic',
-      confidence: assignment.confidence,
-      evidence: assignment.evidence,
-      voltage: assignment.voltage ?? null,
+    store.setRailLabel(id, entry.net, entry.label, {
+      source: entry.source,
+      confidence: entry.confidence,
+      evidence: entry.evidence,
+      voltage: entry.voltage,
     })
     applied += 1
+    // Every name the bench now knows goes into the cross-board library, which is
+    // what makes the next board easier than this one.
+    const signature = netSignature(board, entry.net)
+    if (signature) {
+      railLibrary.learn({
+        name: entry.label,
+        voltage: entry.voltage,
+        signature,
+        boardId: id,
+        boardName,
+        net: entry.net,
+        source: entry.source,
+      })
+    }
   }
 
+  const pinsOf = new Map((board.nets ?? []).map((net) => [net.name, net.pins.length]))
   const map = {
     at: new Date().toISOString(),
-    schematic: schematic.name ?? null,
-    assignments: match.assignments,
-    // Only choices a technician can act on: an ambiguous count, or an equality
-    // too small to assert on its own.
-    ambiguous: match.ambiguous.filter((entry) => entry.confidence === 'choice' || entry.nets.length === 1),
-    parts: match.parts,
-    rails: match.rails.map((rail) => ({ name: rail.name, pins: rail.pins })),
-    unmatched: match.unmatched.map((rail) => ({ name: rail.name, pins: rail.pins })),
-    warnings: match.warnings,
+    schematic: schematic?.name ?? null,
+    assignments: plan.applied.map((entry) => ({
+      net: entry.net,
+      rail: entry.rail,
+      voltage: entry.voltage ?? null,
+      confidence: entry.confidence,
+      source: entry.source,
+      evidence: entry.evidence ?? [],
+      pins: pinsOf.get(entry.net) ?? 0,
+    })),
+    // Questions the bench can answer with one click: a name the schematic
+    // proves but the counts could not, a shape another board recognises, or the
+    // schematic's own rail vocabulary.
+    suggestions: plan.suggestions,
+    vocabulary: plan.vocabulary.slice(0, 12),
+    unmatched: plan.unmatched,
+    warnings: plan.notes,
   }
   store.writeRailMap(id, map)
-  return { applied, kept, ambiguous: map.ambiguous.length, error: match.warnings[0] ?? null }
+  return {
+    applied,
+    kept,
+    ambiguous: plan.suggestions.length,
+    learned: railLibrary.all().length,
+    error: plan.notes[0] ?? null,
+  }
 }
 
 /** Human-readable enrichment report, shared by the route and the tool. */
@@ -1273,60 +1315,61 @@ function buildTools(ctx, config) {
       if (loaded.error) return { text: loaded.error, isError: true }
       const { meta, board } = loaded
       const schematic = store.readSchematic(meta.id)
-      if (!schematic) {
-        return {
-          text: `"${meta.name}" has no schematic attached, so no rail can be named from one. Attach the PDF (or a text/CSV netlist) and enrichment runs again automatically.`,
-          isError: true,
+      const labels = store.readRailLabels(meta.id)
+      const map = store.readRailMap(meta.id)
+
+      const lines = [`Rail map for "${meta.name}"${schematic ? ` against "${schematic.name}"` : ' (no schematic attached)'}:`]
+
+      const named = Object.entries(labels).filter(([, entry]) => entry?.label)
+      if (named.length === 0) {
+        lines.push('  No rail is named yet.')
+      } else {
+        lines.push('  Named rails:')
+        for (const [net, entry] of named) {
+          const volts = formatVoltage(entry.voltage)
+          const pads = (board.nets ?? []).find((candidate) => candidate.name === net)?.pins.length ?? 0
+          const via = entry.source === 'bench' ? 'named at the bench' : `from ${entry.source === 'prior-board' ? 'another board' : 'the schematic'}`
+          lines.push(`    ${net} = ${entry.label}${volts ? ` at ${volts}` : ' (voltage not printed)'} — ${pads} pads, ${via}${entry.confidence ? `, ${entry.confidence}` : ''}`)
+          for (const line of (entry.evidence ?? []).slice(0, 2)) lines.push(`      · ${line}`)
         }
       }
 
-      const match = matchSchematicRails(board, schematic)
-      const labels = store.readRailLabels(meta.id)
-      const named = match.assignments.map((assignment) => {
-        const owned = labels[assignment.net]
-        const shown = owned?.label ?? assignment.rail
-        const from = owned?.source === 'schematic' ? 'schematic' : owned?.label ? 'bench' : 'unapplied'
-        const volts = formatVoltage(assignment.voltage)
-        return `${assignment.net} = ${shown}${volts ? ` at ${volts}` : ' (voltage not printed)'} — ${assignment.pins} pads on ${assignment.part}, ${assignment.pins} pins on ${assignment.rail} in the schematic (${from}${assignment.confidence === 'high' ? ', high' : ', medium'})`
-      })
-
-      const choices = match.ambiguous.filter((entry) => entry.confidence === 'choice')
-      const small = match.ambiguous.filter((entry) => entry.confidence !== 'choice')
-      const lines = [`Rail map for "${meta.name}" against "${schematic.name}":`]
-      lines.push(
-        named.length > 0
-          ? `  Named by pin-count fingerprint:\n${named.map((line) => `    ${line}`).join('\n')}`
-          : '  No net could be named: no unique pin count matched a net on any part.',
-      )
-      if (choices.length > 0) {
-        lines.push('  Open choices — the counts collide, so this is the technician\'s call:')
-        for (const entry of choices.slice(0, 5)) {
+      const suggestions = map?.suggestions ?? []
+      if (suggestions.length > 0) {
+        lines.push('  Open questions — one click each, never guessed:')
+        for (const entry of suggestions.slice(0, 6)) {
+          const choices = entry.choices ?? entry.supplies ?? []
           lines.push(
-            `    ${entry.count} pins on ${entry.part}: nets ${entry.nets.join(', ')} ↔ supplies ${entry.supplies.join(', ')}`,
+            `    ${entry.net}${entry.pins ? ` (${entry.pins} pads)` : ''}: ${choices.join(' / ')} — ${entry.reason ?? 'counts collide'}`,
           )
         }
       }
-      if (small.length > 0) {
-        lines.push(
-          `  Suggested but not applied (below the 20-pin threshold): ${small
-            .map((entry) => `${entry.nets.join('/')} = ${entry.supplies.join('/')} (${entry.count} pads)`)
-            .join('; ')}`,
-        )
-      }
-      if (match.unmatched.length > 0) {
-        lines.push(
-          `  Supplies in the schematic that matched no net: ${match.unmatched.map((rail) => `${rail.name} (${rail.pins} pins)`).join(', ')}`,
-        )
-      }
-      for (const warning of match.warnings) lines.push(`  ${warning}`)
 
-      if (choices.length > 0) {
-        const entry = choices[0]
-        const options = entry.supplies.slice(0, 4).map((name) => ({ label: name, description: `${entry.count} pins` }))
+      const vocabulary = (map?.vocabulary ?? []).map((word) => word.name)
+      if (vocabulary.length > 0) {
+        lines.push(`  Rail names this schematic prints: ${vocabulary.slice(0, 14).join(', ')}`)
+      }
+      const unmatched = map?.unmatched ?? []
+      if (unmatched.length > 0) {
+        lines.push(
+          `  Supplies that matched no net: ${unmatched.map((rail) => `${rail.name} (${rail.pins} pins)`).join(', ')}`,
+        )
+      }
+      const learned = railLibrary.knownNames(6)
+      if (learned.length > 0) {
+        lines.push(
+          `  Learned from boards on this bench: ${learned.map((row) => `${row.name}${row.voltage === null ? '' : ` (${row.voltage} V)`}`).join(', ')}`,
+        )
+      }
+      for (const warning of map?.warnings ?? []) lines.push(`  ${warning}`)
+
+      const first = suggestions.find((entry) => (entry.choices ?? entry.supplies ?? []).length > 0)
+      if (first) {
+        const options = (first.choices ?? first.supplies).slice(0, 4).map((name) => ({ label: name, description: 'from the schematic' }))
         options.push({ label: 'not sure yet', description: 'leave it unnamed' })
         lines.push('')
         lines.push(
-          `ask_user_question: { question: "Which supply is ${entry.nets[0]} on ${entry.part}?", header: "Rail", options: ${JSON.stringify(options)} }`,
+          `ask_user_question: { question: "Which rail is ${first.net}?", header: "Rail", options: ${JSON.stringify(options)} }`,
         )
       }
       return { text: lines.join('\n') }

@@ -75,6 +75,7 @@
   "rail.none": "该文件未命名电源轨，也没有网络的焊盘数量足以分组。",
   "rail.openChoice": "数量相同，原理图无法区分；请选择板上实际存在的电源轨",
   "rail.pads": "焊盘",
+  "rail.priorTag": "既往",
   "rail.schematicTag": "原理图",
   "rail.skipChoice": "跳过",
   "rail.title": "电源轨",

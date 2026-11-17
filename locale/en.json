@@ -75,6 +75,7 @@
   "rail.none": "This file names no rails and no net reaches enough pads to group one.",
   "rail.openChoice": "counts collide — the schematic cannot separate these; pick the one the board shows",
   "rail.pads": "pads",
+  "rail.priorTag": "prior",
   "rail.schematicTag": "sch",
   "rail.skipChoice": "skip",
   "rail.title": "Rails",

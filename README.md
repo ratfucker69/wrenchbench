@@ -66,6 +66,21 @@ Repair questions do not run in a workspace conversation. WrenchBench owns one se
 
 The agent is the same agent loop, tools and model as anywhere else — only the session is separate. The reply context (board, rail groups with their voltages, marks, canvas focus) reaches it through the system prompt, so the technician's own words go in verbatim and come back exactly as drawn. Harness scaffolding — runtime-context blocks, skill notices, checkpoint messages — is filtered out of the transcript rather than shown as if they had typed it.
 
+## Naming rails, on any board
+
+Rails are named by a set of independent strategies that merge into one proposal list, because one trick does not survive a bench that sees hundreds of boards:
+
+| Strategy | What it needs | Strength |
+|---|---|---|
+| `pin-position` | a schematic that prints a supply once per pin (`VDDCR_GFX_A12`) | proved: unique pin count on both sides |
+| `schematic-name` | a voltage-named net (`1.35V_G6_VMEMIO`) | the voltage the schematic states, by stem |
+| `prior-board` | a rail named on another board with a similar shape | a suggestion with the other board cited |
+| `vocabulary` | any rail name the schematic prints | a one-click shortlist for anything left |
+
+Only a proved match is written down. Everything else is a suggestion carrying its reason, and a name learned from another board is never applied on its own — a different board can share a shape and be a different rail.
+
+Every name the bench proves or you confirm is remembered with its electrical shape (`rail-library.json`), so the next board starts from what this one taught you. The panel shows the shortlist as clickable chips in the rail legend; the agent gets it through `wrenchbench_rail_map`.
+
 ## Naming rails from the schematic
 
 A vendor boardview calls every net `Net72`, and its designators (`C00173`, `N16136`) share no namespace with the schematic's (`C1027`, `IC4001`). Name-matching and refdes-matching across the two files are therefore both impossible, and guessing a voltage from fan-out would put a technician on the wrong rail.
