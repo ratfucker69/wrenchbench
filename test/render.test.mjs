@@ -96,7 +96,9 @@ check('net wiring and pads stay on by default', () => {
 })
 
 console.log('\nlocale parity')
-const used = new Set([...client.matchAll(/t\('([A-Za-z][\w.]*)'\)/g)].map((match) => match[1]))
+// A lookbehind keeps `x.get('etag')` from being read as a t() key — the
+// regex matched it and reported a missing translation for an HTTP header.
+const used = new Set([...client.matchAll(/(?<![\w.$])t\('([A-Za-z][\w.]*)'\)/g)].map((match) => match[1]))
 check('every t() key has an English string', () => {
   const missing = [...used].filter((key) => !en[key] && key !== 'layout')
   assert.deepEqual(missing, [])

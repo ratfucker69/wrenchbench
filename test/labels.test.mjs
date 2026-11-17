@@ -140,6 +140,46 @@ check('clearing removes every mark', () => {
   assert.equal(store.readObservations(boardId).length, 0)
 })
 
+console.log('\ntrash and undo')
+
+check('deleting a board moves it to the trash and restores whole', () => {
+  const id = 'trash-bench-0001'
+  store.saveBoard({ id, name: 'Trash Bench', sourceName: 'trash.brd', format: 'brd', board: fixtureBoard() })
+  const trashed = store.deleteBoard(id)
+  assert.ok(typeof trashed === 'string' && trashed.includes(id), 'the board did not move to the trash')
+  assert.equal(store.listBoards().some((board) => board.id === id), false, 'the trashed board is still listed')
+  const trash = store.listTrash()
+  assert.ok(trash.some((entry) => entry.id === id && entry.name === 'Trash Bench'), JSON.stringify(trash).slice(0, 200))
+  const restored = store.restoreBoard(trashed)
+  assert.equal(restored.restored, true, JSON.stringify(restored))
+  assert.equal(restored.id, id)
+  assert.equal(store.listBoards().some((board) => board.id === id), true, 'the restored board is not in the library')
+  store.deleteBoard(id)
+})
+
+check('a restore never overwrites a board that is already back', () => {
+  const id = 'trash-bench-0002'
+  store.saveBoard({ id, name: 'Twice', sourceName: 'twice.brd', format: 'brd', board: fixtureBoard() })
+  const trashed = store.deleteBoard(id)
+  store.restoreBoard(trashed)
+  const again = store.restoreBoard(trashed)
+  assert.equal(again.restored, false)
+  assert.match(again.error ?? '', /no longer/)
+  store.deleteBoard(id)
+})
+
+check('the trash kept the labels and marks with the board', () => {
+  const id = 'trash-bench-0003'
+  store.saveBoard({ id, name: 'Keep Evidence', sourceName: 'keep.brd', format: 'brd', board: fixtureBoard() })
+  store.setRailLabel(id, '+3V3', 'PP3V3_TEST', { source: 'bench' })
+  store.addObservation(id, { refdes: 'C1', kind: 'short-to-ground', note: '0.3 ohm' })
+  const trashed = store.deleteBoard(id)
+  store.restoreBoard(trashed)
+  assert.equal(store.readRailLabels(id)['+3V3']?.label, 'PP3V3_TEST')
+  assert.equal(store.readObservations(id).length, 1)
+  store.deleteBoard(id)
+})
+
 fs.rmSync(libraryDir, { recursive: true, force: true })
 
 console.log(failures.length === 0 ? `\nLABEL CHECKS PASS (${passed})` : `\n${failures.length} LABEL CHECK(S) FAILED`)

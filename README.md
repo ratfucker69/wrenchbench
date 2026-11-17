@@ -53,6 +53,7 @@ If your setup has no `dsh` CLI on `PATH`, add the package to your profile instea
 2. **Board tab** — `↑` toggles rail colouring, the rail legend is click-to-label, the inspector shows the part, its marking, its pads, its rail, its bench marks, and the ranked next checks.
 3. **Agent tab** — ask in plain language. The agent drives the canvas (`focus`), records marks, and answers with one question.
 4. **Schematic tab** — search the text layer for a refdes, rail or page title; results cite page numbers.
+5. **CSV** on a library entry — the bench record as a spreadsheet: parts, pad counts, every rail with its voltage and evidence, the marks with timings, the part names you set and the schema evidence behind each rail name.
 
 Nothing leaves the machine. The library lives in `%APPDATA%/dsh-wrenchbench` (`~/.local/share/dsh-wrenchbench` on Linux).
 
@@ -135,12 +136,24 @@ Every applied name stores its evidence (page, pin count, pad count, the uniquene
 The panel's Ask tab talks to a WrenchBench-owned repair session, not to the workspace chat; see [The repair session](#the-repair-session).
 | `wrenchbench_name_part` / `wrenchbench_enrich` | confirm a part name, re-run the naming pass |
 
+## Taking the record with you
+
+Every library entry has a `CSV` chip. It downloads the diagnosis, not the geometry — three row types in one sheet:
+
+| Row | What it holds |
+|---|---|
+| `rail` | every grouped rail: net, name, pad count, voltage, and the evidence that named it (page, pin count, uniqueness argument) |
+| `part` | every part in the boardview: refdes, display name (alias or boardview label), pad count, and the rail it sits on |
+| `mark` | each bench finding: part or net, kind, pin, note, reading and timestamp |
+
+Nine columns (`type, key, name, pads, rail, voltage, source, detail, at`) that open as a plain spreadsheet. The boardview itself stays in the library; the sheet is what a warranty claim or a second pair of eyes can read.
+
 ## Tests
 
 No framework, no dependencies — each suite is a script, run in isolation.
 
 ```bash
-node test/run-all.mjs        # 17 suites, no host needed
+node test/run-all.mjs        # 20 suites, no host needed
 node smoke-live.mjs 60127    # every route, against a running host
 npm run tour                 # tour-live.mjs + tour-extra.mjs: a whole project on a
                              # throwaway board, then speed and import variants
@@ -152,7 +165,14 @@ The live scripts drive the routes of a running host exactly as the panel does an
 node test/run-all.mjs
 ```
 
-`des`, `xzz`, `parsers`, `pdf`, `formats`, `naming`, `rails`, `diagnose`, `labels`, `host`.
+`des`, `xzz`, `parsers`, `pdf`, `formats`, `naming`, `rails`, `diagnose`, `labels`, `host`, `resolve`, `focus`, `order`, `render`, `rail-naming`, `schematic-rails`, `repair-session`, `contracts`, `client`, `client-board`.
+
+Three of those exist for a specific fault rather than for a feature:
+
+- **`render`** asserts the panel's source: canvas constants, hit-test radius, paint order, and that every `t()` key has both an English and a Chinese string.
+- **`client`** evaluates the real bundle against a React stub. A render-time exception used to blank the panel with no message anywhere; this suite calls the component and fails on the throw.
+- **`client-board`** goes further and mounts the panel with a real board behind it: a hooks runtime (state, effects, re-render) plus `fetch` wired into the plugin's own host routes, so the rail legend, the marks and the library entries are rendered from real data. A branch that throws blanked the panel and nothing caught it — now a render fault fails the suite, and the suite carries a deliberate fault to prove it would notice.
+- **`contracts`** asserts the route contract itself: one path per route, `405` for a method a route does not implement, `413` for an oversized body, `404`/`400` for an unknown or traversing id, and that the `alias` route accepts both field names callers send. Field drift between a tool and its route was a real bug; a feature test only exercises the fields its own caller sends.
 
 ## Contributing
 

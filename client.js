@@ -1337,6 +1337,9 @@ window.__ModuleLoader__.load({
           const [rails, setRails] = React.useState([])
           // How those rails got their names, and which ones are still a choice.
           const [railMap, setRailMap] = React.useState(null)
+          // The board payload is megabytes; remember its ETag so a refresh can
+          // come back 304 instead of re-sending the model.
+          const boardTagRef = React.useRef({ id: null, etag: null })
           const [railOfPart, setRailOfPart] = React.useState(null)
           const [observations, setObservations] = React.useState([])
           const [checks, setChecks] = React.useState({ suspects: [], notes: [] })
@@ -1453,9 +1456,21 @@ window.__ModuleLoader__.load({
             }
             let alive = true
             setBusy('board')
-            getJson(`${ROUTE}/board?id=${encodeURIComponent(activeId)}`)
+            // Conditional fetch: the model only changes when the record does, and
+            // a 2.6 MB body per tab switch is not free.
+            const sentTag = boardTagRef.current.id === activeId ? boardTagRef.current.etag : null
+            fetch(`${ROUTE}/board?id=${encodeURIComponent(activeId)}`, {
+              headers: sentTag ? { 'if-none-match': sentTag } : {},
+            })
+              .then(async (response) => {
+                if (response.status === 304) return null
+                const tag = response.headers.get('etag')
+                const body = await response.json()
+                if (tag) boardTagRef.current = { id: activeId, etag: tag }
+                return body
+              })
               .then((body) => {
-                if (!alive) return
+                if (!alive || body === null) return
                 setDoc(body)
                 setSchematic(body.schematic ?? null)
                 setRails(Array.isArray(body.rails) ? body.rails : [])
@@ -1651,18 +1666,35 @@ window.__ModuleLoader__.load({
             [loadIndex, t],
           )
 
+          // Deleting a board moves it to the trash; the undo stays on screen so
+          // a mis-click cannot cost a repair's labels and marks.
+          const [undo, setUndo] = React.useState(null)
           const removeBoard = React.useCallback(
             async (id) => {
               try {
-                await sendJson(`${ROUTE}/board?id=${encodeURIComponent(id)}`, 'DELETE')
+                const body = await sendJson(`${ROUTE}/board?id=${encodeURIComponent(id)}`, 'DELETE')
                 setActiveId((current) => (current === id ? null : current))
                 await loadIndex()
+                if (body?.trash) setUndo({ entry: body.trash, id })
               } catch (error) {
                 setNotice(error instanceof Error ? error.message : String(error))
               }
             },
             [loadIndex],
           )
+
+          const undoDelete = React.useCallback(async () => {
+            if (!undo?.entry) return
+            try {
+              const body = await sendJson(`${ROUTE}/board/restore`, 'POST', { entry: undo.entry })
+              setUndo(null)
+              await loadIndex()
+              if (body?.id) setActiveId(body.id)
+              setNotice(t('library.restored'))
+            } catch (error) {
+              setNotice(error instanceof Error ? error.message : String(error))
+            }
+          }, [undo, loadIndex])
 
           // --- schematic -----------------------------------------------------
           const uploadSchematic = React.useCallback(
@@ -1822,15 +1854,32 @@ window.__ModuleLoader__.load({
             }
           }, [])
 
-          // Refreshed while the Agent tab is open: a short repair thread is a
-          // few messages, and polling keeps one code path instead of a second
-          // stream to keep in sync.
+          // Refreshed while the Agent tab is open: quick while an answer is in
+          // flight, slow when the thread is idle, and paused entirely while the
+          // page is hidden — a poll nobody can see is a poll nobody needs.
           React.useEffect(() => {
             if (!activeId || tab !== 'agent') return undefined
-            loadThread(activeId)
-            const timer = setInterval(() => loadThread(activeId), 2500)
-            return () => clearInterval(timer)
-          }, [activeId, tab, loadThread])
+            let cancelled = false
+            let timer = null
+            const tick = () => {
+              if (cancelled) return
+              const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
+              if (hidden) {
+                timer = setTimeout(tick, 10000)
+                return
+              }
+              loadThread(activeId).finally(() => {
+                if (cancelled) return
+                const busy = askState.status === 'sending' || thread.running
+                timer = setTimeout(tick, busy ? 800 : 8000)
+              })
+            }
+            tick()
+            return () => {
+              cancelled = true
+              if (timer) clearTimeout(timer)
+            }
+          }, [activeId, tab, loadThread, askState.status, thread.running])
 
           // --- ask the agent -------------------------------------------------
           const askAgent = React.useCallback(async () => {
@@ -2454,6 +2503,19 @@ window.__ModuleLoader__.load({
                           { style: { display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' } },
                           h('span', { className: 'wb-chip' }, boardMeta.format),
                           boardMeta.schematic ? h('span', { className: 'wb-chip' }, `PDF ${boardMeta.schematic.stats.pages}p`) : null,
+                          // The diagnosis travels: marks, rail names and part names
+                          // as a spreadsheet a warranty claim can read.
+                          h(
+                            'a',
+                            {
+                              className: 'wb-chip',
+                              href: `${ROUTE}/export?id=${encodeURIComponent(boardMeta.id)}`,
+                              download: '',
+                              title: t('panel.library.export'),
+                              style: { textDecoration: 'none', color: 'inherit', cursor: 'pointer' },
+                            },
+                            t('panel.library.exportTag'),
+                          ),
                         ),
                       ),
                       h(
@@ -3145,7 +3207,7 @@ window.__ModuleLoader__.load({
                         ),
                       )
                     : null,
-                  notice
+                  notice || undo
                     ? h(
                         'div',
                         {
@@ -3154,6 +3216,9 @@ window.__ModuleLoader__.load({
                             bottom: 8,
                             left: 8,
                             right: 8,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 8,
                             fontSize: 11,
                             color: T.muted,
                             background: 'var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-layer-1, #fff))',
@@ -3162,7 +3227,10 @@ window.__ModuleLoader__.load({
                             padding: '5px 8px',
                           },
                         },
-                        notice,
+                        h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, notice ?? t('library.trashed')),
+                        undo
+                          ? h('button', { type: 'button', onClick: undoDelete, style: { ...BUTTON, padding: '2px 8px', fontSize: 11 } }, t('library.undo'))
+                          : null,
                       )
                     : null,
                 ),

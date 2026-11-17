@@ -25,6 +25,7 @@ import { matchSchematicRails } from './schematic-rails.js'
 import { netSignature, planRailNames, labelEntriesFor, railVocabulary } from './rail-naming.js'
 import { createRailLibrary } from './rail-library.js'
 import { createRepairThread } from './repair-session.js'
+import { createHash } from 'node:crypto'
 import { classifyParts, displayRefdes, isPlaceholderRefdes, planNaming } from './naming.js'
 import { resolveQuery } from './resolve.js'
 import { nextChecks } from './diagnose.js'
@@ -58,12 +59,15 @@ function renderToolOutput(_args, value) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function sendJson(res, status, value) {
+function sendJson(res, status, value, headers = {}) {
   const body = JSON.stringify(value)
+  // Headers ride on writeHead rather than res.setHeader so the response shape
+  // stays the one a route is given: one call, no method the harness must supply.
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'content-length': Buffer.byteLength(body),
+    ...headers,
   })
   res.end(body)
 }
@@ -1656,15 +1660,18 @@ function createRoutes(ctx, config) {
       const id = url.searchParams.get('id') ?? ''
 
       if (req.method === 'DELETE') {
-        // The bench thread belongs to the board: a deleted board must not leave
-        // a session and a repair directory behind.
+        // A board carries labels, volts, marks and its schematic, so deleting is
+        // reversible: it moves to the trash and comes back whole from the undo
+        // the panel offers.
         const threadId = store.readRepairSession(id)
-        const removed = store.deleteBoard(id)
-        if (removed) await repairThread.forget(id)
+        const trashed = store.deleteBoard(id)
+        if (trashed) await repairThread.forget(id)
         return sendJson(
           res,
-          removed ? 200 : 404,
-          removed ? { removed: true, thread: threadId ? 'removed' : null } : { error: 'no such board' },
+          trashed ? 200 : 404,
+          trashed
+            ? { removed: true, trash: trashed, thread: threadId ? 'removed' : null, restore: `${ROUTE}/board/restore` }
+            : { error: 'no such board' },
         )
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'method not allowed')
@@ -1673,8 +1680,30 @@ function createRoutes(ctx, config) {
       const loaded = store.readBoard(id)
       if (!loaded) return fail(res, 404, 'that board is not in the library')
 
-      store.markViewed(id)
       const schematic = store.readSchematic(id)
+      const labelsForTag = store.readRailLabels(id)
+      const observationsForTag = store.readObservations(id)
+      const railMapForTag = store.readRailMap(id)
+      const digest = createHash('sha1')
+        .update(
+          [
+            id,
+            loaded.meta.updatedAt ?? '',
+            Object.keys(labelsForTag).sort().join(','),
+            observationsForTag.length,
+            railMapForTag?.at ?? '',
+            schematic?.uploadedAt ?? '',
+          ].join('|'),
+        )
+        .digest('hex')
+        .slice(0, 20)
+      const etag = `"${digest}"`
+      if (String(req.headers['if-none-match'] ?? '') === etag) {
+        res.writeHead(304, { etag, 'cache-control': 'no-store' })
+        res.end()
+        return
+      }
+      store.markViewed(id)
       // Rail grouping and the bench marks travel with the board so the canvas
       // and the agent describe the same electrical picture.
       const railModel = assignComponentRails(loaded.board, {
@@ -1704,7 +1733,130 @@ function createRoutes(ctx, config) {
           mmPerUnit: mmPerUnit(config, loaded.board),
         }),
         focus: store.readFocus(),
+      }, { etag })
+    },
+  })
+
+  // --- undo a delete -------------------------------------------------------
+  routes.push({
+    kind: 'exact',
+    path: `${ROUTE}/board/restore`,
+    handler: async (req, res) => {
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        return sendJson(res, 200, { trash: store.listTrash() })
+      }
+      if (req.method !== 'POST') return fail(res, 405, 'method not allowed')
+      let body
+      try {
+        body = await readJsonBody(req, 8 * 1024)
+      } catch (error) {
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
+      }
+      const entry = String(body?.entry ?? '').trim()
+      if (entry.length === 0) return fail(res, 400, 'a trash entry is required')
+      const restored = store.restoreBoard(entry)
+      if (!restored.restored) return fail(res, 409, restored.error ?? 'could not restore')
+      return sendJson(res, 200, { restored: true, id: restored.id })
+    },
+  })
+
+  // --- bench record as a file ----------------------------------------------
+  //
+  // Marks, rail names and part names are the diagnosis, and they used to exist
+  // only inside the library. A CSV is what a warranty claim or the next
+  // technician can actually read.
+  routes.push({
+    kind: 'exact',
+    path: `${ROUTE}/export`,
+    handler: (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const id = url.searchParams.get('id') ?? ''
+      if (!store.isBoardId(id)) return fail(res, 400, 'a valid board id is required')
+      const loaded = store.readBoard(id)
+      if (!loaded) return fail(res, 404, 'that board is not in the library')
+      const labels = store.readRailLabels(id)
+      const observations = store.readObservations(id)
+      const aliases = store.readAliases(id)
+      const schematic = store.readSchematic(id)
+
+      // The same grouping the board route hands the panel, so the sheet and the
+      // canvas can never disagree about which rail a part sits on.
+      let rails = []
+      let assignment = new Map()
+      try {
+        const model = assignComponentRails(loaded.board, { aliases: railAliasesFor(id, loaded.board, schematic) })
+        rails = model.rails
+        assignment = model.assignment
+      } catch {
+        rails = []
+      }
+      applyRailLabels(rails, labels)
+      ensureLabelledRails(loaded.board, rails, labels)
+
+      const escape = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`
+      const rows = [['type', 'key', 'name', 'pads', 'rail', 'voltage', 'source', 'detail', 'at']]
+
+      for (const rail of rails) {
+        rows.push([
+          'rail',
+          rail.name,
+          rail.label ?? '',
+          rail.pads ?? 0,
+          rail.name,
+          formatVoltage(rail.voltage) ?? '',
+          rail.labelSource ?? '',
+          (rail.labelEvidence ?? []).join(' | '),
+          '',
+        ])
+      }
+
+      const parts = loaded.board.parts ?? []
+      const pinsByPart = new Map()
+      for (const pin of loaded.board.pins ?? []) {
+        if (typeof pin.part !== 'number') continue
+        pinsByPart.set(pin.part, (pinsByPart.get(pin.part) ?? 0) + 1)
+      }
+      for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+        const part = parts[partIndex]
+        if (!part) continue
+        const net = assignment.get(partIndex) ?? null
+        const rail = net ? rails.find((candidate) => candidate.name === net) : null
+        const alias = aliases[part.refdes]
+        rows.push([
+          'part',
+          part.refdes,
+          displayRefdes(part, alias),
+          pinsByPart.get(partIndex) ?? part.pins ?? 0,
+          net ?? '',
+          rail?.label ? formatVoltage(rail.voltage) ?? '' : '',
+          alias?.alias ? (alias.source ?? 'bench') : (part.layer ?? ''),
+          net ? (rail?.label ?? rail?.alias ?? '') : '',
+          '',
+        ])
+      }
+
+      for (const mark of observations) {
+        rows.push([
+          'mark',
+          mark.refdes ?? mark.net ?? '',
+          mark.refdes ?? mark.net ?? '',
+          '',
+          mark.net ?? '',
+          '',
+          'bench',
+          `${mark.kind ?? ''}${mark.pin ? ` pin ${mark.pin}` : ''}${mark.note ? ` — ${mark.note}` : ''}`,
+          mark.at ?? '',
+        ])
+      }
+
+      const csv = rows.map((row) => row.map(escape).join(',')).join('\n')
+      const name = `${String(loaded.meta.name).replace(/[^A-Za-z0-9._-]+/g, '_')}-bench.csv`
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': `attachment; filename="${name}"`,
+        'cache-control': 'no-store',
       })
+      res.end(csv)
     },
   })
 

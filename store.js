@@ -30,6 +30,7 @@ function resolveRoot() {
 
 export const dataRoot = resolveRoot()
 const libraryRoot = path.join(dataRoot, 'library')
+const trashRoot = path.join(dataRoot, 'trash')
 const focusFile = path.join(dataRoot, 'focus.json')
 
 function ensureDir(dir) {
@@ -197,15 +198,82 @@ export function markViewed(id) {
   return next
 }
 
+/**
+ * Trash a board: move it out of the library, do not destroy it.
+ *
+ * A board carries labels, voltages, marks and the schematic — the only part of
+ * the record that cannot be regenerated from a boardview. Deleting is therefore
+ * reversible by default: the directory moves to `trash/` under its own name and
+ * comes back whole, and the list of what is in the trash is what the panel's
+ * undo offers.
+ *
+ * @param {string} id board id
+ * @returns {string|false} the trash entry name, or false when nothing moved
+ */
 export function deleteBoard(id) {
   if (!isBoardId(id)) return false
+  const source = boardDir(id)
+  if (!fs.existsSync(source)) return false
   try {
-    fs.rmSync(boardDir(id), { recursive: true, force: true })
+    ensureDir(trashRoot)
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const entry = `${id}__${stamp}`
+    fs.renameSync(source, path.join(trashRoot, entry))
     const focus = readFocus()
     if (focus?.boardId === id) writeFocus({ boardId: null, refdes: null, net: null, pin: null, annotation: null })
-    return true
+    return entry
   } catch {
     return false
+  }
+}
+
+/** What is in the trash, newest first: `{entry, id, name, trashedAt}`. */
+export function listTrash() {
+  let entries = []
+  try {
+    entries = fs.readdirSync(trashRoot, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const rows = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const [id, stamp] = String(entry.name).split('__')
+    if (!id) continue
+    const meta = readJson(path.join(trashRoot, entry.name, 'meta.json'))
+    rows.push({
+      entry: entry.name,
+      id,
+      name: meta?.name ?? id,
+      trashedAt: stamp ?? null,
+      boards: meta?.stats?.pins ?? null,
+    })
+  }
+  return rows.sort((a, b) => String(b.trashedAt).localeCompare(String(a.trashedAt)))
+}
+
+/**
+ * Put a trashed board back.
+ *
+ * Refuses when a board with that id is already back in the library rather than
+ * overwriting it: a restore must never destroy a newer copy.
+ *
+ * @param {string} entry the trash entry name from `listTrash`
+ * @returns {{restored: boolean, id?: string, error?: string}}
+ */
+export function restoreBoard(entry) {
+  const name = String(entry ?? '')
+  if (!/^[a-z0-9][a-z0-9-]{0,80}__[0-9A-Za-z-]+$/.test(name)) return { restored: false, error: 'unknown trash entry' }
+  const id = name.split('__')[0]
+  if (!isBoardId(id)) return { restored: false, error: 'unknown trash entry' }
+  const source = path.join(trashRoot, name)
+  if (!fs.existsSync(source)) return { restored: false, error: 'that entry is no longer in the trash' }
+  if (fs.existsSync(boardDir(id))) return { restored: false, error: 'a board with that id is already in the library' }
+  try {
+    fs.renameSync(source, boardDir(id))
+    return { restored: true, id }
+  } catch (error) {
+    return { restored: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
