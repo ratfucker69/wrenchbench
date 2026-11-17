@@ -20,7 +20,7 @@ import path from 'node:path'
 import { BoardParseError, parseBoard, SUPPORTED_EXTENSIONS } from './parsers.js'
 import { pagesForToken, searchSchematic } from './pdf-text.js'
 import { extractSchematic } from './schematic.js'
-import { assignComponentRails, classifyRails, deriveRailAliases, voltageOf } from './rails.js'
+import { assignComponentRails, classifyRails, deriveRailAliases, ensureLabelledRails, formatVoltage, voltageOf } from './rails.js'
 import { matchSchematicRails } from './schematic-rails.js'
 import { classifyParts, displayRefdes, isPlaceholderRefdes, planNaming } from './naming.js'
 import { resolveQuery } from './resolve.js'
@@ -271,7 +271,9 @@ function applyRailLabels(rails, labels) {
       rail.labelSource = owned.source ?? 'bench'
       rail.labelConfidence = owned.confidence ?? (rail.labelSource === 'bench' ? 'confirmed' : null)
       rail.labelEvidence = owned.evidence ?? []
-      const volts = voltageOf(owned.label)
+      // A stated voltage beats one decoded from the name, which beats nothing.
+      const stated = typeof owned.voltage === 'number' ? owned.voltage : null
+      const volts = stated ?? voltageOf(owned.label)
       if (volts !== null) rail.voltage = volts
     } else if (rail.alias) {
       rail.labelSource = 'schematic'
@@ -398,6 +400,7 @@ function nameRailsFromSchematic(id, board, schematic) {
       source: 'schematic',
       confidence: assignment.confidence,
       evidence: assignment.evidence,
+      voltage: assignment.voltage ?? null,
     })
     applied += 1
   }
@@ -552,6 +555,7 @@ function buildTools(ctx, config) {
       const railGroups = classifyRails(board)
       const railLabels = store.readRailLabels(meta.id)
       applyRailLabels(railGroups.rails, railLabels)
+      ensureLabelledRails(board, railGroups.rails, railLabels)
       const grounds = board.nets.filter((net) => net.ground).slice(0, 6)
       const largest = [...board.parts].sort((a, b) => b.pins - a.pins).slice(0, 12)
       const schematic = store.readSchematic(meta.id)
@@ -564,10 +568,16 @@ function buildTools(ctx, config) {
         '',
         `Rail groups (${railGroups.rails.length}, ≥${railGroups.threshold} pads or a named voltage):`,
         ...railGroups.rails.map((rail) => {
-          const label = rail.label && rail.label !== rail.name ? ` (labelled ${rail.label})` : ''
-          return `  ${rail.name}${label} — ${rail.pads} pads (${rail.reach}% of the board)${
-            rail.voltage === null ? ', no voltage in the name' : `, ${rail.voltage} V`
-          }`
+          const volts = formatVoltage(rail.voltage)
+          const named = rail.label && rail.label !== rail.name ? rail.label : null
+          // "1.35 V (VMEMIO)" is how the bench talks about a rail; the raw net
+          // name stays in brackets so the record and the boardview still agree.
+          const head = volts
+            ? `${volts}${named ? ` (${named})` : ''}`
+            : named
+              ? `${named} (voltage not printed)`
+              : rail.name
+          return `  ${head} — ${rail.name}, ${rail.pads} pads (${rail.reach}% of the board)`
         }),
         railGroups.rails.length > 0 && Object.keys(railLabels).length === 0
           ? 'None of these rails is labelled. The schematic names its own rails (VDDCR_SOC, PP1V8_S0, +3V3…); find one with wrenchbench_schematic, ask the technician which net it lands on, and record it with wrenchbench_label_rail. The legend, the canvas colouring and the per-component rail assignment all follow the label.'
@@ -1275,7 +1285,8 @@ function buildTools(ctx, config) {
         const owned = labels[assignment.net]
         const shown = owned?.label ?? assignment.rail
         const from = owned?.source === 'schematic' ? 'schematic' : owned?.label ? 'bench' : 'unapplied'
-        return `${assignment.net} = ${shown} — ${assignment.pins} pads on ${assignment.part}, ${assignment.pins} pins on ${assignment.rail} in the schematic (${from}${assignment.confidence === 'high' ? ', high' : ', medium'})`
+        const volts = formatVoltage(assignment.voltage)
+        return `${assignment.net} = ${shown}${volts ? ` at ${volts}` : ' (voltage not printed)'} — ${assignment.pins} pads on ${assignment.part}, ${assignment.pins} pins on ${assignment.rail} in the schematic (${from}${assignment.confidence === 'high' ? ', high' : ', medium'})`
       })
 
       const choices = match.ambiguous.filter((entry) => entry.confidence === 'choice')
@@ -1612,7 +1623,12 @@ function createRoutes(ctx, config) {
       const railModel = assignComponentRails(loaded.board, {
         aliases: railAliasesFor(id, loaded.board, schematic),
       })
-      applyRailLabels(railModel.rails, store.readRailLabels(id))
+      const labels = store.readRailLabels(id)
+      applyRailLabels(railModel.rails, labels)
+      // A rail named from the schematic must appear even when its pad count is
+      // too small to have been grouped: otherwise it is in the record and
+      // missing from the legend and the triage choices.
+      ensureLabelledRails(loaded.board, railModel.rails, labels)
       const observations = store.readObservations(id)
       return sendJson(res, 200, {
         meta: loaded.meta,
@@ -1802,7 +1818,9 @@ function createRoutes(ctx, config) {
       const railModel = assignComponentRails(loaded.board, {
         aliases: railAliasesFor(id, loaded.board, schematic),
       })
-      applyRailLabels(railModel.rails, store.readRailLabels(id))
+      const labelsAfter = store.readRailLabels(id)
+      applyRailLabels(railModel.rails, labelsAfter)
+      ensureLabelledRails(loaded.board, railModel.rails, labelsAfter)
       // An entry the technician has now answered stops being an open question.
       const map = store.readRailMap(id)
       if (map && Array.isArray(map.ambiguous)) {
@@ -1941,21 +1959,53 @@ function createRoutes(ctx, config) {
         const agents = ctx.get('agents')
         const controller = ctx.get('sessionController')
         if (!agents || !controller) {
-          return sendJson(res, 503, { accepted: false, reason: 'no-session', detail: 'The agent services are not available in this profile.' })
+          return sendJson(res, 503, {
+            accepted: false,
+            reason: 'no-session',
+            detail: 'The agent services are not available in this profile.',
+          })
         }
 
-        const roots = typeof agents.roots === 'function' ? agents.roots() : []
-        const target = roots.length > 0 ? roots[roots.length - 1] : undefined
+        // Roots first, then any live agent: a resumed session is still a root,
+        // but a host with only child agents would otherwise report no session.
+        let candidates = []
+        if (typeof agents.roots === 'function') candidates = agents.roots()
+        if (candidates.length === 0 && typeof agents.list === 'function') candidates = agents.list()
+        const target = candidates.length > 0 ? candidates[candidates.length - 1] : undefined
         if (!target) {
-          return sendJson(res, 200, { accepted: false, reason: 'no-session' })
+          return sendJson(res, 200, {
+            accepted: false,
+            reason: 'no-session',
+            detail: 'No agent session is live. Send a message in the chat first, then ask from the panel.',
+          })
         }
 
-        await controller.prompt({
-          requestId: `wrenchbench-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-          sessionId: target.id,
-          mode: 'queue',
-          content: [{ type: 'text', text }],
-        })
+        // The admission call requires a live AbortSignal — it calls
+        // signal.throwIfAborted() before queueing, so omitting one throws and
+        // the whole request failed with a bare 500. Time-boxed so a wedged
+        // admission cannot hang the panel.
+        const abort = new AbortController()
+        const timer = setTimeout(() => abort.abort(), 20000)
+        try {
+          await controller.prompt(
+            {
+              requestId: `wrenchbench-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
+              sessionId: target.id,
+              mode: 'queue',
+              content: [{ type: 'text', text }],
+            },
+            abort.signal,
+          )
+        } catch (error) {
+          const code = error?.code ?? error?.name ?? 'prompt-failed'
+          return sendJson(res, 200, {
+            accepted: false,
+            reason: String(code),
+            detail: error instanceof Error ? error.message : String(error),
+          })
+        } finally {
+          clearTimeout(timer)
+        }
 
         return sendJson(res, 200, { accepted: true, sessionId: String(target.id), composed: text })
       } catch (error) {
@@ -2052,7 +2102,9 @@ function benchProtocolText(config) {
     if (!loaded) return ''
     const { board } = loaded
     const railGroups = classifyRails(board, { limit: 8 })
-    applyRailLabels(railGroups.rails, store.readRailLabels(active.id))
+    const liveLabels = store.readRailLabels(active.id)
+    applyRailLabels(railGroups.rails, liveLabels)
+    ensureLabelledRails(board, railGroups.rails, liveLabels)
     const schematic = store.readSchematic(active.id)
     const { suspects } = nextChecks(board, observations, { limit: 3, mmPerUnit: mmPerUnit(config, board) })
 

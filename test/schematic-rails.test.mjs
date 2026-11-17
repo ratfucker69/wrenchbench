@@ -11,7 +11,9 @@
  */
 import assert from 'node:assert/strict'
 
-const { ballLabelledRails, matchSchematicRails, AUTO_ASSIGN_PINS } = await import('../schematic-rails.js')
+const { ballLabelledRails, matchSchematicRails, voltageTokens, voltageForSupply, AUTO_ASSIGN_PINS } =
+  await import('../schematic-rails.js')
+const { ensureLabelledRails, formatVoltage } = await import('../rails.js')
 
 let passed = 0
 const failures = []
@@ -262,6 +264,92 @@ check('the real-shaped case resolves the way the bench verified it', () => {
     assert.ok(['high', 'medium'].includes(entry.confidence))
     assert.ok(entry.pins >= AUTO_ASSIGN_PINS)
   }
+})
+
+console.log('\nvoltages, as the bench names them')
+
+check('a stated voltage is read off the supply stem', () => {
+  const index = voltageTokens({
+    pages: [{ page: 7, text: '1.0V_SOC_VGFX 1.35V_G6_VMEMIO 0.85V_SOC_VMEMP 3.3V_VRM 12V_MAIN' }],
+  })
+  assert.equal(voltageForSupply(index, 'VDDCR_GFX')?.volts, 1)
+  assert.equal(voltageForSupply(index, 'VMEMIO')?.volts, 1.35)
+  assert.equal(voltageForSupply(index, 'VMEMP')?.volts, 0.85)
+})
+
+check('two different voltages for one stem is "not stated", not a pick', () => {
+  const index = voltageTokens({ pages: [{ page: 3, text: '1.0V_SOC_VSOC 1.8V_SOC' }] })
+  assert.equal(voltageForSupply(index, 'VDDCR_SOC'), null)
+})
+
+check('the domain word in a net name does not claim a rail', () => {
+  // 1.8V_SOC_V18_S5 ends in the domain code S5, not in a supply stem, so it
+  // must not be read as VDDCR_SOC's voltage.
+  const index = voltageTokens({ pages: [{ page: 3, text: '1.8V_SOC_V18_S5 0.75V_SOC_VCR_S5' }] })
+  assert.equal(voltageForSupply(index, 'VDDCR_SOC'), null)
+})
+
+check('a supply with no stated voltage stays unknown', () => {
+  const index = voltageTokens({ pages: [{ page: 1, text: 'VDDCR_GFX_A12 VDDCR_GFX_A14' }] })
+  assert.equal(voltageForSupply(index, 'VDDCR_GFX'), null)
+})
+
+check('matching attaches the voltage and its evidence', () => {
+  const model = board([[['GND', 30], ['Net73', 40], ['Net108', 60]]])
+  const result = matchSchematicRails(
+    model,
+    {
+      pages: [
+        { page: 7, text: `${balls(40).map((ball) => `VDDCR_GFX_${ball}`).join(' ')}` },
+        { page: 26, text: '1.0V_SOC_VGFX' },
+      ],
+    },
+  )
+  const gfx = result.assignments.find((entry) => entry.rail === 'VDDCR_GFX')
+  assert.ok(gfx, 'VDDCR_GFX was not matched')
+  assert.equal(gfx.voltage, 1)
+  assert.match(gfx.evidence.join(' '), /1.0V_SOC_VGFX/)
+})
+
+check('a rail with no stated voltage reports null rather than a guess', () => {
+  const model = board([[['GND', 30], ['Net73', 40]]])
+  const result = matchSchematicRails(
+    model,
+    { pages: [{ page: 7, text: balls(40).map((ball) => `VDDCR_GFX_${ball}`).join(' ') }] },
+  )
+  assert.equal(result.assignments[0].voltage, null)
+})
+
+console.log('\nthe simple name a technician uses')
+
+check('volts print the way the bench says them', () => {
+  assert.equal(formatVoltage(1), '1.0 V')
+  assert.equal(formatVoltage(1.35), '1.35 V')
+  assert.equal(formatVoltage(3.3), '3.3 V')
+  assert.equal(formatVoltage(12), '12 V')
+  assert.equal(formatVoltage(5), '5 V')
+  assert.equal(formatVoltage(null), null)
+})
+
+check('a named rail that reaches few pads is still listed', () => {
+  const model = board([[['GND', 400], ['Net72', 300], ['Net75', 12]]])
+  const { rails } = { rails: [{ name: 'Net72', pads: 300, voltage: null, label: 'Net72', alias: null, colour: '#000', reach: 10 }] }
+  ensureLabelledRails(model, rails, {
+    Net75: { label: 'VDDCR_SOC', voltage: 1, source: 'schematic', confidence: 'medium' },
+  })
+  const added = rails.find((rail) => rail.name === 'Net75')
+  assert.ok(added, 'the named rail was dropped from the list')
+  assert.equal(added.label, 'VDDCR_SOC')
+  assert.equal(added.voltage, 1)
+  assert.equal(added.pads, 12)
+})
+
+check('an unnamed rail is not added and a labelled one is not duplicated', () => {
+  const model = board([[['GND', 400], ['Net72', 300]]])
+  const rails = [{ name: 'Net72', pads: 300, voltage: null, label: 'Net72', alias: null, colour: '#000', reach: 10 }]
+  ensureLabelledRails(model, rails, { Net72: { label: 'VMEMIO', voltage: 1.35 }, GND: { label: 'GND' }, Net999: { label: 'X' } })
+  assert.equal(rails.length, 1)
+  assert.equal(rails[0].voltage, null, 'the caller applies labels; this only adds missing rails')
 })
 
 console.log('')

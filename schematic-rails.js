@@ -121,6 +121,84 @@ export function ballLabelledRails(schematic) {
   return { rails, byPins, warnings }
 }
 
+/**
+ * Supplies the schematic spells with their voltage, indexed for lookup.
+ *
+ * Schematics name the *rail* one way and the *supply* another: `VDDCR_GFX` on
+ * the pin tables, `1.0V_SOC_VGFX` on the net. The last segment of that second
+ * spelling is the supply's own stem (`VGFX` for `VDDCR_GFX`, `VMEMP` for
+ * `VMEMP`), so the voltage can be read off without any connectivity work.
+ *
+ * Only the final segment is used on purpose. Matching anywhere in the name
+ * would let `1.8V_SOC_V18_S5` claim `VDDCR_SOC` on the strength of the word
+ * SOC, which is the domain, not the rail.
+ *
+ * @param {object} schematic the stored schematic text layer
+ * @returns {{byStem: Map<string, {volts: number, token: string, pages: number[]}[]>, tokens: number}}
+ */
+export function voltageTokens(schematic) {
+  const byStem = new Map()
+  let tokens = 0
+  for (const page of schematic?.pages ?? []) {
+    const text = String(page?.text ?? '')
+    if (text.length === 0) continue
+    for (const token of text.split(/[\s\n\r\t]+/)) {
+      if (token.length < 5) continue
+      const match = /^(\d{1,2}(?:[.,]\d{1,2})?)V_([A-Z0-9_]{1,40})$/.exec(token)
+      if (!match) continue
+      const volts = Number(match[1].replace(',', '.'))
+      if (!(volts >= 0.3 && volts <= 24)) continue
+      const segments = match[2].split('_').filter(Boolean)
+      const stem = segments[segments.length - 1]
+      if (!stem || /\d+$/.test(stem)) continue
+      tokens += 1
+      let entries = byStem.get(stem)
+      if (!entries) {
+        entries = []
+        byStem.set(stem, entries)
+      }
+      const existing = entries.find((entry) => entry.token === token)
+      if (existing) {
+        if (!existing.pages.includes(page.page)) existing.pages.push(page.page)
+      } else {
+        entries.push({ volts, token, pages: [page.page] })
+      }
+    }
+  }
+  return { byStem, tokens }
+}
+
+/**
+ * The voltage the schematic states for one supply, if it states exactly one.
+ *
+ * A stem can be reached two ways — the token's own stem *is* the supply's stem
+ * (`VMEMIO`), or it ends with it (`VGFX` for `GFX`). If two different voltages
+ * reach the same supply the answer is "the schematic does not say", not a pick:
+ * a wrong voltage on a rail is worse than no voltage.
+ *
+ * @param {{byStem: Map<string, object[]>}} index from `voltageTokens`
+ * @param {string} supplyName e.g. `VDDCR_GFX`
+ * @returns {{volts: number, token: string, pages: number[]}|null}
+ */
+export function voltageForSupply(index, supplyName) {
+  const name = String(supplyName ?? '').toUpperCase()
+  const parts = name.split('_').filter(Boolean)
+  const stem = parts[parts.length - 1]
+  if (!stem) return null
+
+  const hits = []
+  for (const [tokenStem, entries] of index?.byStem ?? []) {
+    const related = tokenStem === stem || tokenStem.endsWith(stem) || stem.endsWith(tokenStem)
+    if (!related) continue
+    for (const entry of entries) hits.push(entry)
+  }
+  if (hits.length === 0) return null
+  const volts = new Set(hits.map((entry) => entry.volts))
+  if (volts.size !== 1) return null
+  const [best] = hits.sort((a, b) => b.pages.length - a.pages.length)
+  return { volts: best.volts, token: best.token, pages: [...new Set(hits.flatMap((entry) => entry.pages))].sort((a, b) => a - b) }
+}
+
 /** Pads of each part, split by net. */
 function pinsByPart(board) {
   const perPart = new Map()
@@ -157,6 +235,7 @@ export function matchSchematicRails(board, schematic, options = {}) {
   const autoPins = Number.isFinite(options.autoPins) ? Math.max(minPins, options.autoPins) : AUTO_ASSIGN_PINS
   const maxParts = Number.isFinite(options.maxParts) ? Math.max(1, options.maxParts) : 48
   const { rails, byPins, warnings } = ballLabelledRails(schematic)
+  const voltages = voltageTokens(schematic)
   const result = { assignments: [], ambiguous: [], parts: [], rails, unmatched: [], warnings: [...warnings] }
   if (rails.length === 0) return result
 
@@ -235,6 +314,15 @@ export function matchSchematicRails(board, schematic, options = {}) {
       }
       netOwner.set(item.net, refdes)
       railOwner.set(item.supply.name, item.net)
+      const stated = voltageForSupply(voltages, item.supply.name)
+      const evidence = [
+        `schematic lists ${item.count} pins on ${item.supply.name} (page ${item.supply.pages.join(', ') || '?'})`,
+        `${refdes} has ${item.count} pads on ${item.net}`,
+        `no other net of ${refdes} has ${item.count} pads and no other supply reaches ${item.count} pins`,
+      ]
+      if (stated) {
+        evidence.push(`schematic prints ${stated.token} (page ${stated.pages.join(', ')}), which is ${item.supply.name} at ${stated.volts} V`)
+      }
       result.assignments.push({
         net: item.net,
         rail: item.supply.name,
@@ -242,11 +330,10 @@ export function matchSchematicRails(board, schematic, options = {}) {
         part: refdes,
         partIndex: candidate.partIndex,
         confidence: item.count >= autoPins * 2 ? 'high' : 'medium',
-        evidence: [
-          `schematic lists ${item.count} pins on ${item.supply.name} (page ${item.supply.pages.join(', ') || '?'})`,
-          `${refdes} has ${item.count} pads on ${item.net}`,
-          `no other net of ${refdes} has ${item.count} pads and no other supply reaches ${item.count} pins`,
-        ],
+        // The simple name the bench uses: 1.0 V, 1.35 V, 3.3 V. Null when the
+        // schematic does not state one, never estimated.
+        voltage: stated ? stated.volts : null,
+        evidence,
         samples: item.supply.balls.slice(0, 6),
       })
     }

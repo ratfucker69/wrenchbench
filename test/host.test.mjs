@@ -18,6 +18,7 @@ const store = await import('../store.js')
 const routes = []
 const tools = []
 const registered = []
+const services = {}
 
 const ctx = {
   webServer: {
@@ -36,8 +37,10 @@ const ctx = {
     registered.push(fn())
     return () => {}
   },
-  get() {
-    return undefined
+  // Services the host may look up at request time. Tests install fakes here so
+  // the agent-prompt route can be driven without a live Agent.
+  get(name) {
+    return services[name]
   },
 }
 
@@ -268,6 +271,110 @@ expect(
 
 const wrongMethod = await call('/api/dsh-wrenchbench/import', { method: 'GET', url: '/api/dsh-wrenchbench/import' })
 expect('a wrong method is refused', wrongMethod.status === 405, String(wrongMethod.status))
+
+// --- asking the agent ------------------------------------------------------
+//
+// This route shipped broken once: it called sessionController.prompt() without
+// the AbortSignal the admission contract requires, the service threw, and the
+// panel showed nothing usable. The fakes below are deliberately strict — the
+// controller refuses a call without a signal, exactly like the real one.
+console.log('\n# ask the agent')
+
+const prompts = []
+services.agents = { roots: () => [{ id: 'session-1' }] }
+services.sessionController = {
+  async prompt(request, signal) {
+    // Same guard the real service runs before admitting anything.
+    const check = signal?.throwIfAborted
+    if (typeof check !== 'function') throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
+    check.call(signal)
+    prompts.push({ request, aborted: signal.aborted })
+    return { accepted: true }
+  },
+}
+
+const asked = await call('/api/dsh-wrenchbench/ask', {
+  method: 'POST',
+  url: '/api/dsh-wrenchbench/ask',
+  body: JSON.stringify({ question: 'is Net72 shorted to ground?', board: boardId }),
+  headers: { 'content-type': 'application/json' },
+})
+expect(
+  'a question is admitted into the live session',
+  asked.status === 200 && asked.json?.accepted === true && asked.json?.sessionId === 'session-1',
+  `${asked.status} ${asked.text.slice(0, 200)}`,
+)
+expect('the prompt carries a live AbortSignal', prompts.length === 1 && prompts[0].aborted === false, JSON.stringify(prompts))
+expect(
+  'the prompt names the board on the canvas',
+  /board on the canvas/.test(prompts[0]?.request?.content?.[0]?.text ?? ''),
+  (prompts[0]?.request?.content?.[0]?.text ?? '').slice(0, 160),
+)
+expect(
+  'the question is queued rather than steered',
+  prompts[0]?.request?.mode === 'queue' && typeof prompts[0]?.request?.requestId === 'string',
+  JSON.stringify(prompts[0]?.request?.mode),
+)
+
+// A rejection has to reach the panel with its reason, not as a bare 500.
+services.sessionController = {
+  async prompt() {
+    const error = new Error('another writer holds this session')
+    error.code = 'session/writer-held'
+    throw error
+  },
+}
+const refused = await call('/api/dsh-wrenchbench/ask', {
+  method: 'POST',
+  url: '/api/dsh-wrenchbench/ask',
+  body: JSON.stringify({ question: 'ping', board: boardId }),
+  headers: { 'content-type': 'application/json' },
+})
+expect(
+  'a refused admission comes back with its reason',
+  refused.status === 200 &&
+    refused.json?.accepted === false &&
+    refused.json?.reason === 'session/writer-held' &&
+    /writer holds/.test(refused.json?.detail ?? ''),
+  `${refused.status} ${refused.text.slice(0, 200)}`,
+)
+
+// No live agent at all is a normal state early in a session, not an error.
+services.agents = { roots: () => [] , list: () => [] }
+const noSession = await call('/api/dsh-wrenchbench/ask', {
+  method: 'POST',
+  url: '/api/dsh-wrenchbench/ask',
+  body: JSON.stringify({ question: 'ping', board: boardId }),
+  headers: { 'content-type': 'application/json' },
+})
+expect(
+  'no live session is reported as such, with a next step',
+  noSession.json?.accepted === false && noSession.json?.reason === 'no-session' && /Send a message/.test(noSession.json?.detail ?? ''),
+  noSession.text.slice(0, 200),
+)
+
+// A live child agent (no roots) must still receive the question.
+services.sessionController = {
+  async prompt(request, signal) {
+    signal?.throwIfAborted?.()
+    prompts.push({ request })
+    return { accepted: true }
+  },
+}
+services.agents = { roots: () => [], list: () => [{ id: 'child-9' }] }
+const childAsk = await call('/api/dsh-wrenchbench/ask', {
+  method: 'POST',
+  url: '/api/dsh-wrenchbench/ask',
+  body: JSON.stringify({ question: 'ping', board: boardId }),
+  headers: { 'content-type': 'application/json' },
+})
+expect(
+  'a live child agent is a valid target when no root is registered',
+  childAsk.json?.sessionId === 'child-9',
+  childAsk.text.slice(0, 160),
+)
+delete services.agents
+delete services.sessionController
 
 console.log('\n# cleanup')
 const deleted = await call('/api/dsh-wrenchbench/board', {

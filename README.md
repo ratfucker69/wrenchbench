@@ -70,6 +70,18 @@ VMEMP       47 pins ── Net74   47 pads on N15900   high
 VDDCR_SOC   32 pins ── Net75   32 pads on N15900   medium
 ```
 
+Where the schematic also prints the voltage — `1.35V_G6_VMEMIO`, `0.85V_SOC_VMEMP`, `3.3V_VRM` — that becomes the name the bench uses, with the schematic's own label kept beside it:
+
+```
+1.35 V  (VMEMIO)       Net72   1276 pads
+1.0 V   (VDDCR_GFX)    Net73    340 pads
+1.0 V   (VDDCR_CORE)   Net108   149 pads
+0.85 V  (VMEMP)        Net74     80 pads
+VDDCR_SOC (voltage not printed)   Net75     48 pads
+```
+
+The voltage is read from the **last segment** of a voltage-named net (`1.35V_G6_VMEMIO` → `VMEMIO`), never from a word inside it: `1.8V_SOC_V18_S5` ends in the domain code `S5`, so it cannot claim `VDDCR_SOC`. When two different voltages reach one supply the rail is printed as "voltage not printed" — a wrong voltage on a rail is worse than none.
+
 This runs by itself after every import and every schematic upload. The rules that keep it honest:
 
 - **Under 20 pins nothing is written down.** Nineteen different parts on the EDM-010 own exactly one 5-pad net, so a small equality proves nothing. 8–19 pins is offered as a suggestion for the technician; 20 and up is applied.
@@ -98,7 +110,7 @@ Every applied name stores its evidence (page, pin count, pad count, the uniquene
 
 ## Tests
 
-No framework, no dependencies — each suite is a script, run in isolation:
+No framework, no dependencies — each suite is a script, run in isolation. `smoke-live.mjs` is the end-to-end pass: it drives the routes of a running host exactly as the panel does and prints one line per feature.
 
 ```bash
 node test/run-all.mjs

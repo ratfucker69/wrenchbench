@@ -391,6 +391,9 @@ export function setRailLabel(id, net, label, extra = {}) {
       source: typeof extra.source === 'string' && extra.source.length > 0 ? extra.source : 'bench',
       confidence: typeof extra.confidence === 'string' ? extra.confidence : null,
       evidence: Array.isArray(extra.evidence) ? extra.evidence.slice(0, 6) : [],
+      // Only a stated voltage is stored. Anything else would be an estimate on
+      // a rail, which is exactly the number a technician must not guess.
+      voltage: typeof extra.voltage === 'number' && Number.isFinite(extra.voltage) ? extra.voltage : null,
       at: new Date().toISOString(),
     }
   }

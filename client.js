@@ -314,6 +314,18 @@ window.__ModuleLoader__.load({
       mono: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
     }
 
+    /**
+     * The short spelling of a rail voltage: `1.0 V`, `1.35 V`, `3.3 V`, `12 V`.
+     * Kept local because the client bundle cannot import the host module, and
+     * it must print exactly what the host prints.
+     */
+    const railVolts = (volts) => {
+      if (typeof volts !== 'number' || !Number.isFinite(volts)) return null
+      const rounded = Math.round(volts * 100) / 100
+      const text = rounded < 10 && Number.isInteger(rounded) ? rounded.toFixed(1) : String(rounded)
+      return `${text} V`
+    }
+
     const BUTTON = {
       appearance: 'none',
       border: T.border,
@@ -2969,12 +2981,31 @@ window.__ModuleLoader__.load({
                                       whiteSpace: 'nowrap',
                                     },
                                   },
-                                  rail.label && rail.label !== rail.name ? rail.label : rail.name,
+                                  railVolts(rail.voltage) ??
+                                    (rail.label && rail.label !== rail.name ? rail.label : rail.name),
                                 ),
+                                railVolts(rail.voltage) && rail.label && rail.label !== rail.name
+                                  ? h(
+                                      'span',
+                                      {
+                                        style: {
+                                          color: T.muted,
+                                          flex: 'none',
+                                          fontFamily: T.mono,
+                                          fontSize: 9.5,
+                                          maxWidth: 78,
+                                          overflow: 'hidden',
+                                          textOverflow: 'ellipsis',
+                                          whiteSpace: 'nowrap',
+                                        },
+                                      },
+                                      rail.label,
+                                    )
+                                  : null,
                                 h(
                                   'span',
                                   { style: { color: T.muted, flex: 'none' } },
-                                  rail.voltage === null ? `${rail.pads} ${t('rail.pads')}` : `${rail.voltage} V`,
+                                  `${rail.pads} ${t('rail.pads')}`,
                                 ),
                                 // Where the name came from. A schematic match is
                                 // arithmetic, not a label someone typed, so it says so
@@ -3169,8 +3200,9 @@ window.__ModuleLoader__.load({
             )
 
           const triageBrief = () => {
+            const chosen = triage.rail ? rails.find((entry) => entry.name === triage.rail) : null
             const rail = triage.rail
-              ? `${rails.find((entry) => entry.name === triage.rail)?.label ?? triage.rail}`
+              ? `${railVolts(chosen?.voltage) ?? chosen?.label ?? triage.rail}${chosen?.label && railVolts(chosen?.voltage) ? ` (${triage.rail})` : ''}`
               : 'an unknown rail'
             const symptom = triage.symptom ? t(`triage.symptom.${triage.symptom}`) : 'an unreported fault'
             const finding = triage.finding ? t(`triage.finding.${triage.finding}`) : 'not measured yet'
@@ -3211,9 +3243,21 @@ window.__ModuleLoader__.load({
               h('div', { style: { fontSize: 11, color: T.muted } }, `2 · ${t('triage.step.rail')}`),
               rails.length > 0
                 ? chipRow(
-                    rails.slice(0, 8).map((rail) => ({
+                    [...rails]
+                      .sort((a, b) => {
+                        const aKnown = a.voltage !== null || (a.label && a.label !== a.name) ? 1 : 0
+                        const bKnown = b.voltage !== null || (b.label && b.label !== b.name) ? 1 : 0
+                        if (aKnown !== bKnown) return bKnown - aKnown
+                        return b.pads - a.pads
+                      })
+                      .slice(0, 8)
+                      .map((rail) => ({
                       id: rail.name,
-                      label: `${rail.label && rail.label !== rail.name ? rail.label : rail.name}`,
+                      // Same simple naming the legend uses: the voltage when it
+                      // is known, otherwise the schematic name, otherwise the net.
+                      label:
+                        railVolts(rail.voltage) ??
+                        (rail.label && rail.label !== rail.name ? rail.label : rail.name),
                     })),
                     triage.rail,
                     (id) => setTriage((existing) => ({ ...existing, rail: existing.rail === id ? null : id })),

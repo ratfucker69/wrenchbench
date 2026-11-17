@@ -89,6 +89,65 @@ const RAIL_COLOURS = [
 ]
 
 /**
+ * The short, bench-friendly spelling of a rail voltage: `1.0 V`, `1.35 V`,
+ * `3.3 V`, `12 V`.
+ *
+ * A technician asks for "the 3.3" and "the 12", not for `PP1V8_S0`, so the
+ * voltage is what the legend leads with once it is known. One decimal is kept
+ * for whole volts under ten so `1` reads as `1.0` and cannot be mistaken for
+ * pin 1.
+ */
+export function formatVoltage(volts) {
+  if (typeof volts !== 'number' || !Number.isFinite(volts)) return null
+  const rounded = Math.round(volts * 100) / 100
+  // Whole volts print plainly ("5 V", "12 V"); one volt keeps a decimal so it
+  // cannot be read as a pin number ("1.0 V").
+  const text = rounded === 1 ? '1.0' : String(rounded)
+  return `${text} V`
+}
+
+/**
+ * Make sure every rail the technician has named is actually in the rail list.
+ *
+ * The rail groups are chosen by pad count, so a rail that was named from the
+ * schematic but reaches few pads (`VDDCR_SOC`, 51) would otherwise be labelled
+ * in the record and missing from the legend and the triage choices — the worst
+ * of both worlds. Named rails are appended in pad order, keeping the colours of
+ * the groups already chosen.
+ *
+ * @param {object} board the stored board model
+ * @param {object[]} rails the classified rail groups, mutated in place
+ * @param {Record<string, object>} labels net -> stored label entry
+ * @returns {object[]} the same array
+ */
+export function ensureLabelledRails(board, rails, labels) {
+  if (!labels) return rails
+  const present = new Set(rails.map((rail) => rail.name))
+  const extra = []
+  for (const [net, entry] of Object.entries(labels)) {
+    if (!entry?.label) continue
+    if (present.has(net)) continue
+    // Ground and no-connect nets are never rails, labelled or not.
+    if (GROUND_PATTERN.test(net) || NO_CONNECT_PATTERN.test(net)) continue
+    const known = (board?.nets ?? []).find((candidate) => candidate.name === net)
+    if (!known || known.ground) continue
+    extra.push({
+      name: net,
+      pads: known.pins?.length ?? 0,
+      voltage: typeof entry.voltage === 'number' ? entry.voltage : voltageOf(entry.label),
+      label: entry.label,
+      alias: null,
+      colour: RAIL_COLOURS[(rails.length + extra.length) % RAIL_COLOURS.length],
+      reach: 0,
+      namedOutOfGroup: true,
+    })
+  }
+  extra.sort((a, b) => b.pads - a.pads || a.name.localeCompare(b.name))
+  rails.push(...extra)
+  return rails
+}
+
+/**
  * Rank the nets of one board into rail groups.
  *
  * A net qualifies when it is neither ground nor a no-connect, and either the
