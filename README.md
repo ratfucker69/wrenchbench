@@ -122,7 +122,16 @@ The panel's Ask tab talks to a WrenchBench-owned repair session, not to the work
 
 ## Tests
 
-No framework, no dependencies — each suite is a script, run in isolation. `smoke-live.mjs` is the end-to-end pass: it drives the routes of a running host exactly as the panel does and prints one line per feature.
+No framework, no dependencies — each suite is a script, run in isolation.
+
+```bash
+node test/run-all.mjs        # 17 suites, no host needed
+node smoke-live.mjs 60127    # every route, against a running host
+npm run tour                 # tour-live.mjs + tour-extra.mjs: a whole project on a
+                             # throwaway board, then speed and import variants
+```
+
+The live scripts drive the routes of a running host exactly as the panel does and print one line per feature; the tour imports a generated boardview, labels it, marks it, asks about it, attaches a schematic, and deletes it, leaving the bench as it found it.
 
 ```bash
 node test/run-all.mjs

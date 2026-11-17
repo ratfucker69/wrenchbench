@@ -272,6 +272,16 @@ expect(
 const wrongMethod = await call('/api/dsh-wrenchbench/import', { method: 'GET', url: '/api/dsh-wrenchbench/import' })
 expect('a wrong method is refused', wrongMethod.status === 405, String(wrongMethod.status))
 
+// An oversized body is a 413, not a generic 400: "too big" and "malformed" are
+// different problems and the panel reports them differently.
+const oversized = await call('/api/dsh-wrenchbench/observe', {
+  method: 'POST',
+  url: `/api/dsh-wrenchbench/observe?id=${boardId}`,
+  body: JSON.stringify({ note: 'x'.repeat(200 * 1024) }),
+  headers: { 'content-type': 'application/json' },
+})
+expect('an oversized body is refused with 413', oversized.status === 413, `${oversized.status} ${oversized.text.slice(0, 120)}`)
+
 // --- the repair conversation ----------------------------------------------
 //
 // The bench conversation is WrenchBench's own session: created outside the

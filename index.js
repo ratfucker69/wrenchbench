@@ -80,7 +80,7 @@ function readBody(req, limitBytes) {
   return new Promise((resolve, reject) => {
     const declared = Number.parseInt(String(req.headers['content-length'] ?? ''), 10)
     if (Number.isFinite(declared) && declared > limitBytes) {
-      reject(new Error(`the upload is larger than the ${Math.round(limitBytes / 1024 / 1024)} MB ceiling`))
+      reject(Object.assign(new Error(`the upload is larger than the ${Math.round(limitBytes / 1024 / 1024)} MB ceiling`), { statusCode: 413 }))
       return
     }
 
@@ -89,7 +89,7 @@ function readBody(req, limitBytes) {
     req.on('data', (chunk) => {
       total += chunk.length
       if (total > limitBytes) {
-        reject(new Error(`the upload is larger than the ${Math.round(limitBytes / 1024 / 1024)} MB ceiling`))
+        reject(Object.assign(new Error(`the upload is larger than the ${Math.round(limitBytes / 1024 / 1024)} MB ceiling`), { statusCode: 413 }))
         req.destroy()
         return
       }
@@ -1511,6 +1511,9 @@ function createRoutes(ctx, config) {
   const routes = []
   // One repair thread per board, owned here and drawn by the panel.
   const repairThread = createRepairThread({ ctx, root: store.dataRoot, store })
+  // Threads for boards that no longer exist are dropped here, so a bench that
+  // has deleted a hundred projects does not carry a hundred sessions.
+  repairThread.sweep(store.listBoards().map((board) => board.id))
 
   // --- library listing -----------------------------------------------------
   routes.push({
@@ -1564,7 +1567,7 @@ function createRoutes(ctx, config) {
         if (error instanceof BoardParseError) {
           return fail(res, 422, error.message, { reason: error.reason, hint: error.hint })
         }
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
     },
   })
@@ -1596,7 +1599,7 @@ function createRoutes(ctx, config) {
         })
         return sendJson(res, 200, { meta, board: parsed })
       } catch (error) {
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
     },
   })
@@ -1605,13 +1608,21 @@ function createRoutes(ctx, config) {
   routes.push({
     kind: 'exact',
     path: `${ROUTE}/board`,
-    handler: (req, res) => {
+    handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       const id = url.searchParams.get('id') ?? ''
 
       if (req.method === 'DELETE') {
+        // The bench thread belongs to the board: a deleted board must not leave
+        // a session and a repair directory behind.
+        const threadId = store.readRepairSession(id)
         const removed = store.deleteBoard(id)
-        return sendJson(res, removed ? 200 : 404, removed ? { removed: true } : { error: 'no such board' })
+        if (removed) await repairThread.forget(id)
+        return sendJson(
+          res,
+          removed ? 200 : 404,
+          removed ? { removed: true, thread: threadId ? 'removed' : null } : { error: 'no such board' },
+        )
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'method not allowed')
       if (!store.isBoardId(id)) return fail(res, 400, 'a valid board id is required')
@@ -1691,7 +1702,7 @@ function createRoutes(ctx, config) {
           })
           return respond()
         } catch (error) {
-          return fail(res, 400, error instanceof Error ? error.message : String(error))
+          return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
         }
       }
 
@@ -1715,7 +1726,7 @@ function createRoutes(ctx, config) {
         }
         return respond()
       } catch (error) {
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
     },
   })
@@ -1740,7 +1751,7 @@ function createRoutes(ctx, config) {
       try {
         body = await readJsonBody(req, 16 * 1024)
       } catch (error) {
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
       const refdes = String(body?.refdes ?? '').trim()
       if (refdes.length === 0) return fail(res, 400, 'the boardview label (refdes) is required')
@@ -1749,14 +1760,17 @@ function createRoutes(ctx, config) {
         return fail(res, 422, `no component "${refdes}" on this board`, { closest: matches })
       }
       try {
-        store.setAlias(id, refdes, body?.alias ?? null, {
+        // The tool calls this field `name` (it is a part's name to a
+        // technician); the route grew up calling it `alias`. Accept either, so
+        // a caller cannot silently write an empty name.
+        store.setAlias(id, refdes, body?.alias ?? body?.name ?? null, {
           source: body?.source,
           confidence: body?.confidence,
           evidence: body?.evidence,
           candidates: body?.candidates,
         })
       } catch (error) {
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
       return sendJson(res, 200, { aliases: store.readAliases(id) })
     },
@@ -1799,7 +1813,7 @@ function createRoutes(ctx, config) {
       try {
         body = await readJsonBody(req, 8 * 1024)
       } catch (error) {
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
       const net = String(body?.net ?? '').trim()
       if (net.length === 0) return fail(res, 400, 'a net name is required')
@@ -1814,7 +1828,7 @@ function createRoutes(ctx, config) {
           confidence: 'confirmed',
         })
       } catch (error) {
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
 
       const schematic = store.readSchematic(id)
@@ -1918,7 +1932,7 @@ function createRoutes(ctx, config) {
           annotation: body.annotation === undefined ? undefined : body.annotation,
         }))
       } catch (error) {
-        return fail(res, 400, error instanceof Error ? error.message : String(error))
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
       }
     },
   })

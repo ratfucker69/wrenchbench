@@ -21,6 +21,7 @@
  */
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 /** How many turns of history the panel is given. */
@@ -256,5 +257,73 @@ export function createRepairThread({ ctx, root, store }) {
     return { messages, running, sessionId: thread.sessionId }
   }
 
-  return { ensure, reset, ask, conversation, transcriptOf }
+  /**
+   * Remove the thread for a board that is being deleted.
+   *
+   * The board directory goes with the board, so the id file goes with it; what
+   * is left behind is this module's own session directory and the harness's
+   * session folder. Both are ours, and both are only removed when nothing is
+   * live on that session — a repair in progress must not be deleted from under
+   * the technician.
+   */
+  async function forget(boardId) {
+    let removed = { sessionDirectory: false, harnessDirectory: false }
+    try {
+      fs.rmSync(dirFor(boardId), { recursive: true, force: true })
+      removed.sessionDirectory = true
+    } catch {
+      // Left behind; the sweep below will try again next start.
+    }
+    const stored = readId(boardId)
+    if (stored) {
+      const agents = ctx.get('agents')
+      const live = agents && typeof agents.get === 'function' ? agents.get(stored) : undefined
+      if (!live) {
+        const sessionsRoot = path.join(process.env.USERPROFILE ?? process.env.HOME ?? os.homedir(), '.dsh', 'sessions')
+        try {
+          const entries = fs.readdirSync(sessionsRoot).filter((entry) => entry.includes("-repair-" + boardId + "--"))
+          for (const entry of entries) {
+            fs.rmSync(path.join(sessionsRoot, entry), { recursive: true, force: true })
+            removed.harnessDirectory = true
+          }
+        } catch {
+          // The session store may not be on this host; nothing to remove.
+        }
+      }
+    }
+    return removed
+  }
+
+  /**
+   * Drop thread state for boards that no longer exist.
+   *
+   * A deleted board used to leave its repair directory and its session folder
+   * behind, which grows without bound over a repair bench. Called at start.
+   */
+  function sweep(liveBoardIds) {
+    // Only this module's own directory is touched, and only directory entries
+    // that look like board ids: a wider sweep here once reached the library.
+    const repairRoot = path.join(root, 'repair')
+    let swept = 0
+    let entries = []
+    try {
+      entries = fs.readdirSync(repairRoot, { withFileTypes: true })
+    } catch {
+      return 0
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      if (!/^[a-z0-9][a-z0-9-]{0,80}$/.test(entry.name)) continue
+      if (liveBoardIds.includes(entry.name)) continue
+      try {
+        fs.rmSync(path.join(repairRoot, entry.name), { recursive: true, force: true })
+        swept += 1
+      } catch {
+        // Locked or already gone.
+      }
+    }
+    return swept
+  }
+
+  return { ensure, reset, ask, conversation, forget, sweep, transcriptOf }
 }

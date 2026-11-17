@@ -195,6 +195,27 @@ await checkAsync('a board with no thread yet reads as empty, without creating on
   assert.equal(conversation.messages.length, 0)
 })
 
+await checkAsync('deleting the board removes its thread state', async () => {
+  const made = await thread.ask('delete-me', 'Deletable', 'anything')
+  assert.equal(made.accepted, true)
+  const dir = path.join(store.dataRoot, 'repair', 'delete-me')
+  assert.ok(fs.existsSync(dir), 'the thread directory was not created')
+  const removed = await thread.forget('delete-me')
+  assert.equal(removed.sessionDirectory, true)
+  assert.equal(fs.existsSync(dir), false, 'the thread directory survived')
+})
+
+await checkAsync('a sweep drops threads for boards that no longer exist', async () => {
+  await thread.ask('orphan-a', 'Orphan A', 'hi')
+  await thread.ask('orphan-b', 'Orphan B', 'hi')
+  const swept = thread.sweep(['orphan-a'])
+  assert.ok(swept >= 1, 'nothing was swept')
+  const root = path.join(store.dataRoot, 'repair')
+  const left = fs.readdirSync(root)
+  assert.ok(left.includes('orphan-a'), 'a live board lost its thread')
+  assert.ok(!left.includes('orphan-b'), 'an orphaned thread survived')
+})
+
 console.log('\nfailures are reported, never hidden')
 
 await checkAsync('a missing session service is a clear refusal', async () => {
