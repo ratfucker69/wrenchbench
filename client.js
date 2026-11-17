@@ -50,6 +50,7 @@ window.__ModuleLoader__.load({
       'status.parts': 'Comp',
       'status.pins': 'Pins',
       'status.nets': 'Nets',
+      'status.hover': "over a pad to read its net",
       'inspector.title': 'Selection',
       'inspector.none': 'Click a pad or search a refdes to inspect it.',
       'inspector.otherPins': 'Other pins on this net',
@@ -118,6 +119,12 @@ window.__ModuleLoader__.load({
       'startup.padEntries': "pad entries",
       'startup.namedFromSchematic': "named from the schematic",
       'startup.needReview': "need a decision",
+      'pinout.power': "Power",
+      'pinout.ground': "GND",
+      'pinout.signal': "Signals",
+      'pinout.nc': "NC",
+      'probe.title': "Where to probe",
+      'probe.more': "more, easiest first",
       'checks.title': 'Check next',
       'checks.none': 'Mark a part or a rail to get ranked suspects.',
       'checks.asking': 'Ranking…',
@@ -160,6 +167,7 @@ window.__ModuleLoader__.load({
       'status.parts': '元件',
       'status.pins': '引脚',
       'status.nets': '网络',
+      'status.hover': "悬停焊盘查看网络",
       'inspector.title': '选中项',
       'inspector.none': '点击焊盘或搜索位号以查看详情。',
       'inspector.otherPins': '同一网络上的其他引脚',
@@ -227,6 +235,12 @@ window.__ModuleLoader__.load({
       'startup.padEntries': "焊盘条目",
       'startup.namedFromSchematic': "已按原理图命名",
       'startup.needReview': "待确认",
+      'pinout.power': "供电",
+      'pinout.ground': "地",
+      'pinout.signal': "信号",
+      'pinout.nc': "空脚",
+      'probe.title': "探针位置",
+      'probe.more': "更多，优先易探点",
       'checks.title': '下一步检查',
       'checks.none': '标记元件或电源轨以获得排序后的嫌疑列表。',
       'checks.asking': '排序中…',
@@ -422,12 +436,243 @@ window.__ModuleLoader__.load({
         bad: read('--dsw-alias-state-error-primary', '#c25b52'),
         padTop: read('--dsw-alias-brand-primary', '#c9a227'),
         padBottom: read('--dsw-alias-label-secondary', 'rgba(120,140,160,0.75)'),
+        // Component symbol surfaces. The body is a wash so the pads and the
+        // refdes stay the loudest things on the canvas, and the terminal bars
+        // read as metal rather than as another outline.
+        partBody: read('--dsw-alias-bg-layer-1', 'rgba(255,255,255,0.55)'),
+        partTerminal: read('--dsw-alias-label-secondary', 'rgba(90,110,128,0.55)'),
+        partBand: read('--dsw-alias-state-error-primary', '#c25b52'),
       }
     }
 
     // ---------------------------------------------------------------------
     // The canvas renderer
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // Component symbols
+    // ---------------------------------------------------------------------
+
+    /**
+     * Footprint family from a refdes.
+     *
+     * A boardview stores a rectangle per part and nothing about the body, so
+     * the only honest way to draw something recognisable is to use the
+     * designator prefix — which on every schematic convention already encodes
+     * the family. This is presentation only: nothing downstream reads it.
+     */
+    function familyOfRefdes(refdes, pins) {
+      const prefix = (String(refdes ?? '').toUpperCase().match(/^[A-Z]+/) ?? [''])[0]
+      if (prefix === 'FB' || prefix === 'F' || prefix === 'R' || prefix === 'PR' || prefix === 'VR') return 'resistor'
+      if (prefix === 'C' || prefix === 'PC' || prefix === 'TC' || prefix === 'EC') return 'capacitor'
+      if (prefix === 'L' || prefix === 'PL' || prefix === 'FL' || prefix === 'CH') return 'inductor'
+      if (prefix === 'D' || prefix === 'LED' || prefix === 'ZD' || prefix === 'VD') return 'diode'
+      if (prefix === 'Q' || prefix === 'T' || prefix === 'TR') return 'transistor'
+      if (prefix === 'Y' || prefix === 'X' || prefix === 'XTAL') return 'crystal'
+      if (prefix === 'J' || prefix === 'CN' || prefix === 'CON' || prefix === 'P' || prefix === 'SH') return 'connector'
+      if (prefix === 'SW' || prefix === 'S' || prefix === 'BT' || prefix === 'BZ') return 'switch'
+      if (prefix === 'U' || prefix === 'IC' || prefix === 'PU' || prefix === 'SOC') return 'ic'
+      // An unnamed multi-pad body is a chip; an unnamed two-pad body is not
+      // worth guessing about, so it stays a plain block.
+      if (prefix === 'N') return Number(pins) > 3 ? 'ic' : 'generic'
+      return 'generic'
+    }
+
+    /** A rounded rectangle path in the current transform. */
+    function roundedRect(context, x, y, w, h, radius, onePx) {
+      const r = Math.max(0, Math.min(radius, Math.min(w, h) / 2))
+      if (r < onePx * 1.5) {
+        context.rect(x, y, w, h)
+        return
+      }
+      context.moveTo(x + r, y)
+      context.lineTo(x + w - r, y)
+      context.quadraticCurveTo(x + w, y, x + w, y + r)
+      context.lineTo(x + w, y + h - r)
+      context.quadraticCurveTo(x + w, y + h, x + w - r, y + h)
+      context.lineTo(x + r, y + h)
+      context.quadraticCurveTo(x, y + h, x, y + h - r)
+      context.lineTo(x, y + r)
+      context.quadraticCurveTo(x, y, x + r, y)
+    }
+
+    /**
+     * Draw one component as something a technician recognises.
+     *
+     * These are footprint symbols, not schematic symbols: a ceramic capacitor is
+     * a body with two metal end caps, a resistor the same with a flat body, an
+     * inductor gets its coil, a diode its cathode band, and a chip its pin-1
+     * dot and pin fingers. That is what the physical part looks like from
+     * above, which is what the technician is comparing against.
+     *
+     * Everything is drawn inside the part's own bounding box, so a symbol can
+     * never claim space the board says the part does not occupy.
+     */
+    function paintPartSymbol(context, box, family, style, onePx) {
+      const { body, stroke, terminal, band, pinned } = style
+      const w = box.x2 - box.x1
+      const h = box.y2 - box.y1
+      const horizontal = w >= h
+      const long = horizontal ? w : h
+      const short = horizontal ? h : w
+
+      // A two-terminal body: metal caps at each end, body between them.
+      const capThickness = Math.max(short * 0.16, onePx * 1.2)
+      const bodyStart = horizontal ? box.x1 + capThickness : box.y1 + capThickness
+      const bodyEnd = horizontal ? box.x2 - capThickness : box.y2 - capThickness
+
+      context.beginPath()
+      if (family === 'resistor' || family === 'capacitor' || family === 'inductor' || family === 'diode') {
+        // Body.
+        roundedRect(
+          context,
+          horizontal ? bodyStart : box.x1,
+          horizontal ? box.y1 : bodyStart,
+          horizontal ? bodyEnd - bodyStart : w,
+          horizontal ? h : bodyEnd - bodyStart,
+          Math.min(short * 0.22, onePx * 3),
+          onePx,
+        )
+        context.fillStyle = body
+        context.fill()
+        context.strokeStyle = stroke
+        context.lineWidth = onePx
+        context.stroke()
+
+        // End caps.
+        context.beginPath()
+        if (horizontal) {
+          context.rect(box.x1, box.y1, capThickness * 0.85, h)
+          context.rect(box.x2 - capThickness * 0.85, box.y1, capThickness * 0.85, h)
+        } else {
+          context.rect(box.x1, box.y1, w, capThickness * 0.85)
+          context.rect(box.x1, box.y2 - capThickness * 0.85, w, capThickness * 0.85)
+        }
+        context.fillStyle = terminal
+        context.fill()
+
+        // Family detail inside the body.
+        const midX = (box.x1 + box.x2) / 2
+        const midY = (box.y1 + box.y2) / 2
+        context.beginPath()
+        if (family === 'capacitor') {
+          // Two plates, the universal cap read.
+          const gap = Math.max(long * 0.05, onePx * 1.2)
+          if (horizontal) {
+            context.moveTo(midX - gap, box.y1 + h * 0.18)
+            context.lineTo(midX - gap, box.y2 - h * 0.18)
+            context.moveTo(midX + gap, box.y1 + h * 0.18)
+            context.lineTo(midX + gap, box.y2 - h * 0.18)
+          } else {
+            context.moveTo(box.x1 + w * 0.18, midY - gap)
+            context.lineTo(box.x2 - w * 0.18, midY - gap)
+            context.moveTo(box.x1 + w * 0.18, midY + gap)
+            context.lineTo(box.x2 - w * 0.18, midY + gap)
+          }
+          context.strokeStyle = stroke
+          context.lineWidth = onePx * 1.2
+          context.stroke()
+        } else if (family === 'diode') {
+          // Cathode band near one end.
+          context.strokeStyle = band
+          context.lineWidth = Math.max(capThickness * 0.7, onePx * 1.6)
+          if (horizontal) {
+            const bandX = box.x2 - capThickness * 2
+            context.moveTo(bandX, box.y1 + h * 0.12)
+            context.lineTo(bandX, box.y2 - h * 0.12)
+          } else {
+            const bandY = box.y2 - capThickness * 2
+            context.moveTo(box.x1 + w * 0.12, bandY)
+            context.lineTo(box.x2 - w * 0.12, bandY)
+          }
+          context.stroke()
+        } else if (family === 'inductor') {
+          // Three coil bumps along the outer edge.
+          context.strokeStyle = stroke
+          context.lineWidth = onePx
+          const bumps = 3
+          const span = (horizontal ? bodyEnd - bodyStart : bodyEnd - bodyStart) / bumps
+          for (let index = 0; index < bumps; index += 1) {
+            const from = bodyStart + span * index
+            if (horizontal) {
+              context.moveTo(from, box.y1)
+              context.quadraticCurveTo(from + span / 2, box.y1 - short * 0.42, from + span, box.y1)
+            } else {
+              context.moveTo(box.x1, from)
+              context.quadraticCurveTo(box.x1 - short * 0.42, from + span / 2, box.x1, from + span)
+            }
+          }
+          context.stroke()
+        }
+        return
+      }
+
+      if (family === 'transistor') {
+        roundedRect(context, box.x1, box.y1, w, h, Math.min(short * 0.3, onePx * 3), onePx)
+        context.fillStyle = body
+        context.fill()
+        context.strokeStyle = stroke
+        context.lineWidth = onePx
+        context.stroke()
+        // Chamfer marking the collector corner.
+        context.beginPath()
+        const cut = Math.min(w, h) * 0.3
+        context.moveTo(box.x1 + w - cut, box.y1)
+        context.lineTo(box.x1 + w - cut * 0.35, box.y1 + cut * 0.35)
+        context.strokeStyle = stroke
+        context.stroke()
+        return
+      }
+
+      if (family === 'crystal') {
+        roundedRect(context, box.x1, box.y1, w, h, Math.min(short * 0.35, onePx * 3), onePx)
+        context.fillStyle = body
+        context.fill()
+        context.strokeStyle = stroke
+        context.lineWidth = onePx
+        context.stroke()
+        // Inner resonator plates.
+        context.beginPath()
+        const inset = Math.min(w, h) * 0.26
+        context.rect(box.x1 + inset, box.y1 + inset, w - inset * 2, h - inset * 2)
+        context.stroke()
+        return
+      }
+
+      // Chips, connectors, switches and everything else: a body with pin-1.
+      roundedRect(context, box.x1, box.y1, w, h, Math.min(short * 0.12, onePx * 3), onePx)
+      context.fillStyle = body
+      context.fill()
+      context.strokeStyle = stroke
+      context.lineWidth = onePx
+      context.stroke()
+
+      if (pinned && Math.max(w, h) * style.zoom > 26) {
+        // Pin-1 dot, then pin fingers so a fine-pitch package reads as one.
+        const dotR = Math.max(Math.min(w, h) * 0.09, onePx * 1.4)
+        context.beginPath()
+        context.arc(box.x1 + short * 0.2, box.y1 + short * 0.2, dotR, 0, Math.PI * 2)
+        context.fillStyle = stroke
+        context.fill()
+
+        context.beginPath()
+        const tick = Math.max(short * 0.14, onePx * 1.6)
+        const perSide = Math.min(28, Math.max(2, Math.round(style.pins / 4)))
+        for (let index = 0; index < perSide; index += 1) {
+          const fraction = (index + 0.5) / perSide
+          const x = box.x1 + w * fraction
+          const y = box.y1 + h * fraction
+          context.rect(x - onePx, box.y1, onePx * 2, tick)
+          context.rect(x - onePx, box.y2 - tick, onePx * 2, tick)
+          if (style.pins > 8) {
+            context.rect(box.x1, y - onePx, tick, onePx * 2)
+            context.rect(box.x2 - tick, y - onePx, tick, onePx * 2)
+          }
+        }
+        context.fillStyle = terminal
+        context.fill()
+      }
+    }
 
     /**
      * Draw one board scene.
@@ -558,7 +803,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // Component outlines.
+      // Components, drawn as footprint symbols.
       if (ui.showComponents) {
         context.lineWidth = onePx
         for (let partIndex = 0; partIndex < board.parts.length; partIndex += 1) {
@@ -568,20 +813,62 @@ window.__ModuleLoader__.load({
           if (bottomOnly && part.layer !== 'bottom') continue
           const box = part.bbox
           if (!box || (box.x1 === box.x2 && box.y1 === box.y2)) continue
-          const pad = 1.2 * onePx
+
+          // Cull in screen space: a board has thousands of parts and only the
+          // visible ones are worth building a path for.
+          const screenWidth = (box.x2 - box.x1) * zoom
+          const screenHeight = (box.y2 - box.y1) * zoom
+          if (screenWidth < 3 && screenHeight < 3) continue
+
           const isSelected = partIndex === highlightedPartIndex
-          if (dimming && !isSelected) context.globalAlpha = 0.16
+          if (dimming && !isSelected) context.globalAlpha = 0.18
           const railTint = ui.railColour ? railColour.get(railMap?.get(partIndex)) : undefined
-          context.strokeStyle = isSelected ? theme.accent : railTint ?? theme.borderSoft
-          context.lineWidth = (isSelected ? 1.8 : railTint ? 1.4 : 1) * onePx
-          context.strokeRect(box.x1 - pad, box.y1 - pad, box.x2 - box.x1 + pad * 2, box.y2 - box.y1 + pad * 2)
+          const stroke = isSelected ? theme.accent : railTint ?? theme.borderSoft
+          const weight = (isSelected ? 1.8 : railTint ? 1.3 : 0.9) * onePx
+
+          if (Math.max(screenWidth, screenHeight) < 9) {
+            // Too small for a symbol to read: a solid block keeps the board's
+            // density legible instead of turning into a smear of outlines.
+            context.fillStyle = railTint ?? theme.borderSoft
+            context.globalAlpha = isSelected ? 1 : dimming ? 0.25 : 0.7
+            context.fillRect(box.x1, box.y1, Math.max(box.x2 - box.x1, onePx * 2), Math.max(box.y2 - box.y1, onePx * 2))
+            context.globalAlpha = 1
+            continue
+          }
+
+          paintPartSymbol(
+            context,
+            box,
+            familyOfRefdes(part.refdes, part.pins),
+            {
+              body: theme.partBody,
+              stroke,
+              terminal: railTint ?? theme.partTerminal,
+              band: theme.partBand,
+              pinned: part.pins > 4,
+              pins: part.pins,
+              zoom,
+            },
+            weight,
+          )
           context.globalAlpha = 1
         }
       }
 
-      // Pads.
+      // Pads. Drawn in screen-constant size so a 0201 stays clickable at fit
+      // zoom, and batched per colour so a 15 000-pad board is a handful of fills
+      // rather than 15 000 separate paths.
       if (ui.showPads) {
-        const halfSize = clamp(1.5 / Math.max(zoom, 1e-6), 0.35, 40)
+        const halfSize = clamp(3.1 / Math.max(zoom, 1e-6), 0.3, 60)
+        const buckets = new Map()
+        const push = (colour, x, y) => {
+          let list = buckets.get(colour)
+          if (!list) {
+            list = []
+            buckets.set(colour, list)
+          }
+          list.push(x, y)
+        }
         for (let index = 0; index < board.pins.length; index += 1) {
           const pin = board.pins[index]
           if (topOnly && pin.layer !== 'top') continue
@@ -589,12 +876,47 @@ window.__ModuleLoader__.load({
           const isNetPin = highlightPins.has(index)
           const isPartPin = pin.part === highlightedPartIndex
           if (dimming && !isNetPin && !isPartPin) continue
-          if (isNetPin) context.fillStyle = theme.good
-          else if (isPartPin) context.fillStyle = theme.accent
-          else if (ui.railColour && pin.net && railColour.has(pin.net)) context.fillStyle = railColour.get(pin.net)
-          else context.fillStyle = pin.layer === 'top' ? theme.padTop : theme.padBottom
-          context.fillRect(pin.x - halfSize, pin.y - halfSize, halfSize * 2, halfSize * 2)
+          let colour
+          if (isNetPin) colour = theme.good
+          else if (isPartPin) colour = theme.accent
+          else if (ui.railColour && pin.net && railColour.has(pin.net)) colour = railColour.get(pin.net)
+          else colour = pin.layer === 'top' ? theme.padTop : theme.padBottom
+          push(colour, pin.x, pin.y)
         }
+        const radius = halfSize * 0.42
+        for (const [colour, points] of buckets) {
+          context.beginPath()
+          for (let index = 0; index < points.length; index += 2) {
+            roundedRect(
+              context,
+              points[index] - halfSize,
+              points[index + 1] - halfSize,
+              halfSize * 2,
+              halfSize * 2,
+              radius,
+              onePx,
+            )
+          }
+          context.fillStyle = colour
+          context.fill()
+          // A hairline ring keeps touching pads separable on a dense pitch.
+          if (halfSize * zoom >= 2.5) {
+            context.strokeStyle = theme.background
+            context.lineWidth = onePx * 0.7
+            context.stroke()
+          }
+        }
+      }
+
+      // Hovered pad: a ring outside the pad so the target is obvious before a
+      // click, which is what makes a dense pitch usable with a mouse.
+      if (overlay?.hoverPin) {
+        const ringRadius = clamp(7 / Math.max(zoom, 1e-6), 0.4, 80)
+        context.beginPath()
+        context.arc(overlay.hoverPin.x, overlay.hoverPin.y, ringRadius, 0, Math.PI * 2)
+        context.strokeStyle = theme.accent
+        context.lineWidth = 1.6 * onePx
+        context.stroke()
       }
 
       // Probe points (nails): a ring, so they read differently from pads.
@@ -915,10 +1237,16 @@ window.__ModuleLoader__.load({
             showProbes: true,
             showNetWiring: true,
             dim: false,
-            railColour: false,
+            // On by default: a board with no rail grouping shows plain pads,
+            // and a board with rails is immediately readable as supplies.
+            railColour: true,
           })
           const [view, setView] = React.useState({ zoom: 1, panX: 0, panY: 0, rotation: 0, side: 'both' })
           const [cursor, setCursor] = React.useState(null)
+          // The pad under the pointer, so the net name is readable before a
+          // click commits to it — the same affordance the WrenchBoard viewer
+          // has, and the thing that makes a dense pitch workable.
+          const [hover, setHover] = React.useState(null)
           const [, forceRender] = React.useReducer((value) => value + 1, 0)
 
           const canvasRef = React.useRef(null)
@@ -1098,8 +1426,8 @@ window.__ModuleLoader__.load({
               const index = parts.findIndex((part) => part.refdes.toUpperCase() === observation.refdes.toUpperCase())
               if (index >= 0) marks.set(index, observation.kind)
             }
-            return { railColour, railMap: railOfPart, suspectRank, marks, aliases }
-          }, [rails, railOfPart, checks, observations, doc, aliases])
+            return { railColour, railMap: railOfPart, suspectRank, marks, aliases, hoverPin: hover }
+          }, [rails, railOfPart, checks, observations, doc, aliases, hover])
 
           // --- drawing -------------------------------------------------------
           const paint = React.useCallback(() => {
@@ -1378,6 +1706,44 @@ window.__ModuleLoader__.load({
             return () => canvas.removeEventListener('wheel', onWheel)
           }, [doc?.meta?.id])
 
+          /**
+            * Screen positions of every pad, cached per view.
+            *
+            * Both the click hit-test and the hover readout need the nearest pad
+            * to a pointer, and re-projecting 15 000 pads per mouse move is the
+            * one thing that would make hovering feel worse than not having it.
+            */
+          const screenPinsRef = React.useRef({ key: '', xs: null, ys: null, count: 0 })
+          const projectPins = React.useCallback(() => {
+            const canvas = canvasRef.current
+            const current = docRef.current
+            const currentView = viewRef.current
+            if (!canvas || !current) return null
+            const width = canvas.clientWidth
+            const height = canvas.clientHeight
+            const key = [
+              current.meta.id,
+              currentView.zoom,
+              currentView.panX,
+              currentView.panY,
+              currentView.rotation,
+              width,
+              height,
+            ].join('|')
+            const cache = screenPinsRef.current
+            if (cache.key === key && cache.xs && cache.xs.length === current.board.pins.length) return cache
+            const pins = current.board.pins
+            const xs = new Float32Array(pins.length)
+            const ys = new Float32Array(pins.length)
+            for (let index = 0; index < pins.length; index += 1) {
+              const screen = projectPoint(current.board, currentView, width, height, pins[index].x, pins[index].y)
+              xs[index] = screen.x
+              ys[index] = screen.y
+            }
+            screenPinsRef.current = { key, xs, ys, count: pins.length }
+            return screenPinsRef.current
+          }, [])
+
           const hitTest = React.useCallback((screenX, screenY) => {
             const canvas = canvasRef.current
             const current = docRef.current
@@ -1387,16 +1753,21 @@ window.__ModuleLoader__.load({
             const height = canvas.clientHeight
             const board = current.board
 
+            // Pads are drawn ~3 px half-size, so a 12 px grab radius means a
+            // 2 px miss still lands, while "nearest wins" keeps a dense BGA
+            // from selecting the wrong ball.
+            const projected = projectPins()
             let best = null
-            let bestDistance = 9
-            for (let index = 0; index < board.pins.length; index += 1) {
-              const pin = board.pins[index]
-              if (currentView.side !== 'both' && pin.layer !== currentView.side) continue
-              const screen = projectPoint(board, currentView, width, height, pin.x, pin.y)
-              const distance = Math.hypot(screen.x - screenX, screen.y - screenY)
-              if (distance < bestDistance) {
-                bestDistance = distance
-                best = { kind: 'pin', pin, index }
+            let bestDistance = 12
+            if (projected) {
+              for (let index = 0; index < projected.count; index += 1) {
+                const pin = board.pins[index]
+                if (currentView.side !== 'both' && pin.layer !== currentView.side) continue
+                const distance = Math.hypot(projected.xs[index] - screenX, projected.ys[index] - screenY)
+                if (distance < bestDistance) {
+                  bestDistance = distance
+                  best = { kind: 'pin', pin, index }
+                }
               }
             }
             if (best) return best
@@ -1406,12 +1777,20 @@ window.__ModuleLoader__.load({
               const part = board.parts[partIndex]
               if (currentView.side !== 'both' && part.layer !== currentView.side) continue
               const box = part.bbox
-              if (world.x >= box.x1 - 2 && world.x <= box.x2 + 2 && world.y >= box.y1 - 2 && world.y <= box.y2 + 2) {
+              // Body margin, in board units, that stays roughly constant on
+              // screen — a small package is otherwise unclickable at fit zoom.
+              const margin = Math.min(8 / Math.max(currentView.zoom, 1e-6), Math.max(box.x2 - box.x1, box.y2 - box.y1))
+              if (
+                world.x >= box.x1 - margin &&
+                world.x <= box.x2 + margin &&
+                world.y >= box.y1 - margin &&
+                world.y <= box.y2 + margin
+              ) {
                 return { kind: 'part', part, index: partIndex }
               }
             }
             return null
-          }, [])
+          }, [projectPins])
 
           const onPointerDown = React.useCallback(
             (event) => {
@@ -1441,6 +1820,26 @@ window.__ModuleLoader__.load({
             const world = unprojectPoint(current.board, currentView, rect.width, rect.height, screenX, screenY)
             setCursor(world)
 
+            const projected = projectPins()
+            let nearest = null
+            let nearestDistance = 9
+            if (projected && currentView.side !== 'none') {
+              for (let index = 0; index < projected.count; index += 1) {
+                const pin = current.board.pins[index]
+                if (currentView.side !== 'both' && pin.layer !== currentView.side) continue
+                const distance = Math.hypot(projected.xs[index] - screenX, projected.ys[index] - screenY)
+                if (distance < nearestDistance) {
+                  nearestDistance = distance
+                  nearest = pin
+                }
+              }
+            }
+            setHover((previous) => {
+              const nextKey = nearest ? `${nearest.part}:${nearest.index}` : ''
+              const previousKey = previous ? `${previous.part}:${previous.index}` : ''
+              return previousKey === nextKey ? previous : nearest
+            })
+
             const drag = dragRef.current
             if (!drag) return
             const dx = event.clientX - drag.startX
@@ -1449,6 +1848,10 @@ window.__ModuleLoader__.load({
             if (drag.moved) {
               setView((existing) => ({ ...existing, panX: drag.panX + dx, panY: drag.panY + dy }))
             }
+          }, [projectPins])
+
+          const onPointerLeave = React.useCallback(() => {
+            setHover(null)
           }, [])
 
           const onPointerUp = React.useCallback(
@@ -1565,6 +1968,74 @@ window.__ModuleLoader__.load({
             if (!board || !inspectedPart || !railOfPart) return null
             return railOfPart.get(board.parts.indexOf(inspectedPart)) ?? null
           }, [board, inspectedPart, railOfPart])
+
+          /** Pin budget of the selected part: supplies, ground, signals, unused. */
+          const inspectedPinout = React.useMemo(() => {
+            if (!board || !inspectedPart || inspectedPins.length === 0) return null
+            const counts = { power: 0, ground: 0, signal: 0, nc: 0 }
+            const byName = new Map(board.nets.map((net) => [net.name, net]))
+            const railNames = new Set(rails.map((rail) => rail.name))
+            for (const pin of inspectedPins) {
+              if (!pin.net) {
+                counts.nc += 1
+                continue
+              }
+              const net = byName.get(pin.net)
+              if (net?.ground || /^(GND|GROUND|VSS|AGND|DGND|PGND)$/i.test(pin.net)) counts.ground += 1
+              else if (/^(NC|N\.?C\.?|DNC|NO_?CONNECT|RESERVED)$/i.test(pin.net)) counts.nc += 1
+              else if (net?.power || railNames.has(pin.net)) counts.power += 1
+              else counts.signal += 1
+            }
+            return counts
+          }, [board, inspectedPart, inspectedPins, rails])
+
+          /**
+           * Where to probe the selected part's rail.
+           *
+           * "Easiest first" is the ordering that matters at the bench: a
+           * two-terminal passive can be probed without moving the board or
+           * lifting anything, while a 300-pad package needs the board on a
+           * stand. Distance breaks the tie.
+           */
+          const probePlan = React.useMemo(() => {
+            if (!board || !inspectedPart || !inspectedRail) return { points: [], more: 0 }
+            const rail = rails.find((entry) => entry.name === inspectedRail)
+            const railLabel = rail?.label && rail.label !== rail.name ? rail.label : inspectedRail
+            const net = board.nets.find((entry) => entry.name === inspectedRail)
+            const centre = {
+              x: (inspectedPart.bbox.x1 + inspectedPart.bbox.x2) / 2,
+              y: (inspectedPart.bbox.y1 + inspectedPart.bbox.y2) / 2,
+            }
+            const unitsToMm = board.units === 'mm' ? 1 : 0.0254
+            const seen = new Set([inspectedPart.refdes])
+            const found = []
+            for (const pinIndex of net?.pins ?? []) {
+              const pin = board.pins[pinIndex]
+              if (!pin) continue
+              const part = board.parts[pin.part]
+              if (!part || seen.has(part.refdes) || part.pins === 0) continue
+              seen.add(part.refdes)
+              const dx = (part.bbox.x1 + part.bbox.x2) / 2 - centre.x
+              const dy = (part.bbox.y1 + part.bbox.y2) / 2 - centre.y
+              const mm = Math.hypot(dx, dy) * unitsToMm
+              const ease = (part.pins <= 2 ? 40 : part.pins <= 4 ? 22 : part.pins <= 8 ? 8 : 0) - Math.min(mm, 220) * 0.28
+              found.push({
+                refdes: part.refdes,
+                label: aliases[part.refdes]?.alias ?? part.refdes,
+                value: part.value ?? null,
+                pins: part.pins,
+                distance: mm < 100 ? mm.toFixed(1) : Math.round(mm),
+                ease,
+                railLabel,
+              })
+            }
+            found.sort((a, b) => b.ease - a.ease || a.refdes.localeCompare(b.refdes))
+            const points = found.slice(0, 4)
+            return { points, more: Math.max(0, found.length - points.length) }
+          }, [board, inspectedPart, inspectedRail, rails, aliases])
+
+          const probePoints = probePlan.points
+          const probeMore = probePlan.more
 
           const otherNetPins = React.useMemo(() => {            if (!board || !selection.net) return []
             const net = board.nets.find((entry) => entry.name === selection.net)
@@ -1890,6 +2361,16 @@ window.__ModuleLoader__.load({
                 h('span', null, `${board.stats.parts} ${t('status.parts')}`),
                 h('span', null, `${board.stats.pins} ${t('status.pins')}`),
                 h('span', null, `${board.stats.nets} ${t('status.nets')}`),
+                // The pad under the pointer, before a click commits to it.
+                hover
+                  ? h(
+                      'span',
+                      { style: { color: T.brand } },
+                      `${aliases[board.parts[hover.part]?.refdes]?.alias ?? board.parts[hover.part]?.refdes ?? '?'}.${hover.index}${
+                        hover.net ? ` → ${hover.net}` : ''
+                      }`,
+                    )
+                  : h('span', { style: { opacity: 0.45 } }, t('status.hover')),
                 cursor
                   ? h('span', null, `X: ${cursor.x.toFixed(1)}  Y: ${cursor.y.toFixed(1)}`)
                   : h('span', null, 'X: —  Y: —'),
@@ -1925,6 +2406,7 @@ window.__ModuleLoader__.load({
                     onPointerUp,
                     onPointerLeave: () => {
                       setCursor(null)
+                      setHover(null)
                       dragRef.current = null
                     },
                   }),
@@ -2253,6 +2735,74 @@ window.__ModuleLoader__.load({
                                       ? (rails.find((rail) => rail.name === inspectedRail)?.label ?? inspectedRail)
                                       : t('rail.unassigned')
                                   }`,
+                                )
+                              : null,
+                            inspectedPinout
+                              ? h(
+                                  'div',
+                                  { style: { display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 } },
+                                  [
+                                    ['power', t('pinout.power'), T.brand],
+                                    ['ground', t('pinout.ground'), T.muted],
+                                    ['signal', t('pinout.signal'), T.muted],
+                                    ['nc', t('pinout.nc'), T.muted],
+                                  ]
+                                    .filter(([kind]) => inspectedPinout[kind] > 0)
+                                    .map(([kind, label, colour]) =>
+                                      h(
+                                        'span',
+                                        { key: kind, className: 'wb-chip', style: { color: colour } },
+                                        `${label} ${inspectedPinout[kind]}`,
+                                      ),
+                                    ),
+                                )
+                              : null,
+                            probePoints.length > 0
+                              ? h(
+                                  'div',
+                                  { style: { marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 } },
+                                  h(
+                                    'div',
+                                    { style: { fontSize: 10.5, color: T.muted, letterSpacing: 0.4, textTransform: 'uppercase' } },
+                                    `${t('probe.title')} ${probePoints[0].railLabel}`,
+                                  ),
+                                  probePoints.map((point) =>
+                                    h(
+                                      'button',
+                                      {
+                                        key: point.refdes,
+                                        type: 'button',
+                                        onClick: () => zoomToPart(point.refdes),
+                                        style: {
+                                          display: 'flex',
+                                          alignItems: 'baseline',
+                                          gap: 6,
+                                          background: 'transparent',
+                                          border: 'none',
+                                          padding: '1px 0',
+                                          cursor: 'pointer',
+                                          font: 'inherit',
+                                          fontSize: 11,
+                                          color: 'inherit',
+                                          textAlign: 'left',
+                                        },
+                                      },
+                                      h('span', { style: { fontFamily: T.mono, minWidth: 46 } }, point.label),
+                                      h(
+                                        'span',
+                                        { style: { color: T.muted, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                                        point.value ? point.value : `${point.pins} ${t('inspector.pins')}`,
+                                      ),
+                                      h('span', { style: { color: T.muted, fontSize: 10 } }, `${point.distance} mm`),
+                                    ),
+                                  ),
+                                  probeMore > 0
+                                    ? h(
+                                        'div',
+                                        { style: { fontSize: 10.5, color: T.muted } },
+                                        `+ ${probeMore} ${t('probe.more')}`,
+                                      )
+                                    : null,
                                 )
                               : null,
                             h(

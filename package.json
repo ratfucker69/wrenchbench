@@ -1,6 +1,6 @@
 {
   "name": "dsh-wrenchbench",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "WrenchBench: a board-level repair workbench in the sidebar - boardview import and canvas, per-board schematic ingestion, a persistent board library, and agent tools that read the same board the canvas shows.",
   "type": "module",
@@ -34,20 +34,6 @@
     "locale/*.json",
     "icon.svg"
   ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web",
-      "immediately": true,
-      "inject": [
-        "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-slots"
-      ]
-    }
-  }
-}
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
