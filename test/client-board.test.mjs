@@ -360,8 +360,27 @@ function loadBundle(fetchImpl, React) {
     console,
     setTimeout,
     clearTimeout,
-    setInterval: () => 0,
-    clearInterval: () => {},
+    // The panel polls the agent's canvas focus every 2 s. Let the first poll
+    // actually run, once, so a focus the agent set is adopted in the test the
+    // same way it is on the bench; a real interval would keep the process alive.
+    // The panel polls the agent's canvas focus every 2 s. Let a few polls run so a
+    // focus the agent set is adopted as it is on the bench, but cap them: a real
+    // interval would keep the process alive.
+    setInterval: (fn, ms) => {
+      let fired = 0
+      const tick = () => {
+        fired += 1
+        if (fired > 8) return
+        try {
+          fn()
+        } catch {
+          // The panel swallows poll failures too.
+        }
+        setTimeout(tick, Math.min(ms ?? 2000, 10))
+      }
+      return setTimeout(tick, Math.min(ms ?? 2000, 10))
+    },
+    clearInterval: (id) => clearTimeout(id),
     requestAnimationFrame: () => 0,
     cancelAnimationFrame: () => {},
     Promise,
@@ -572,6 +591,23 @@ await check('a blocked turn draws its options as buttons', async () => {
   askRoute.handler = realAsk
   assert.ok(sent, 'clicking an option sent nothing')
   threadFixture.pending = null
+})
+
+await check('an IC’s pins are numbered 1..N in the inspector', async () => {
+  // N15900 is the fixture's big part: focus lands on it, so its pin list is what
+  // the inspector draws.
+  const text = textOf(tree)
+  const pairs = [...text.matchAll(/(\d+)\/(\d+)/g)].map((match) => [Number(match[1]), Number(match[2])])
+  assert.ok(pairs.length > 0, 'no pin numbers rendered for the selected IC')
+  const counts = new Set(pairs.map(([, count]) => count))
+  assert.equal(counts.size, 1, 'the pin count is not stable across rows')
+  const total = [...counts][0]
+  assert.ok(total >= 6, `expected an IC-sized pin count, got ${total}`)
+  const numbers = pairs.map(([number]) => number)
+  assert.equal(numbers[0], 1, 'pins do not start at 1')
+  assert.equal(Math.max(...numbers), Math.min(total, 40), 'pins do not run up to the pin count (or the row cap)')
+  // The vendor pad index is kept, because that is what marks and tools record.
+  assert.match(text, /pad index/, 'the pad index is no longer exposed')
 })
 
 await check('the command list is one click away and lists the gestures', async () => {

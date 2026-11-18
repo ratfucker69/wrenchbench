@@ -570,7 +570,37 @@ window.__ModuleLoader__.load({
      * Everything is drawn inside the part's own bounding box, so a symbol can
      * never claim space the board says the part does not occupy.
      */
-    function paintPartSymbol(context, box, family, style, onePx) {
+    /**
+ * Number an IC's pins 1..N counter-clockwise from the package corner.
+ *
+ * A boardview ships pads in vendor order, which means nothing at the bench. The
+ * technician needs pin 1 where the dot is and pin N where the package ends, so
+ * both the inspector list and the canvas label the same pin with the same
+ * number. Parts with fewer than six pads keep their own pad index: numbering a
+ * resistor's two ends tells nobody anything.
+ */
+function numberedPins(pins) {
+  if (!Array.isArray(pins) || pins.length < 6) return pins
+  let sumX = 0
+  let sumY = 0
+  for (const pin of pins) {
+    sumX += pin.x
+    sumY += pin.y
+  }
+  const cx = sumX / pins.length
+  const cy = sumY / pins.length
+  const start = Math.PI * 0.75
+  const ordered = pins
+    .map((pin) => ({
+      pin,
+      angle: (Math.atan2(pin.y - cy, pin.x - cx) - start + Math.PI * 4) % (Math.PI * 2),
+    }))
+    .sort((a, b) => a.angle - b.angle)
+    .map((entry) => entry.pin)
+  return ordered.map((pin, position) => ({ ...pin, pinNumber: position + 1, pinCount: ordered.length }))
+}
+
+function paintPartSymbol(context, box, family, style, onePx) {
       const { body, stroke, terminal, band, pinned } = style
       const w = box.x2 - box.x1
       const h = box.y2 - box.y1
@@ -966,6 +996,36 @@ window.__ModuleLoader__.load({
             context.strokeStyle = theme.background
             context.lineWidth = onePx * 0.7
             context.stroke()
+          }
+        }
+
+        // Pin numbers on the part being inspected, once the package is big
+        // enough on screen for numerals to sit between the pads without lying
+        // across the board. Same numbering as the inspector list.
+        const selected = highlightedPartIndex >= 0 ? board.parts[highlightedPartIndex] : null
+        const selectedBox = selected?.bbox
+        if (
+          selectedBox &&
+          (selectedBox.x2 - selectedBox.x1) * zoom > 90 &&
+          (selectedBox.y2 - selectedBox.y1) * zoom > 60
+        ) {
+          const partPins = []
+          for (let index = 0; index < board.pins.length; index += 1) {
+            const pin = board.pins[index]
+            if (pin.part === highlightedPartIndex) partPins.push(pin)
+          }
+          if (partPins.length >= 6) {
+            const numbered = numberedPins(partPins)
+            const fontSize = 8.5 / Math.max(zoom, 1e-6)
+            context.save()
+            context.font = `${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`
+            context.textAlign = 'center'
+            context.textBaseline = 'middle'
+            context.fillStyle = theme.label
+            for (const pin of numbered) {
+              context.fillText(String(pin.pinNumber), pin.x, pin.y - halfSize - fontSize * 0.75)
+            }
+            context.restore()
           }
         }
       }
@@ -2287,9 +2347,10 @@ window.__ModuleLoader__.load({
           const inspectedPins = React.useMemo(() => {
             if (!board || !inspectedPart) return []
             const partIndex = board.parts.indexOf(inspectedPart)
-            return board.pins
+            const pins = board.pins
               .map((pin, index) => ({ ...pin, index, pinIndex: index }))
               .filter((pin) => pin.part === partIndex)
+            return numberedPins(pins)
           }, [board, inspectedPart])
 
           const inspectedRail = React.useMemo(() => {
@@ -3721,7 +3782,14 @@ window.__ModuleLoader__.load({
                                       fontFamily: 'inherit',
                                     },
                                   },
-                                  h('span', { style: { fontFamily: T.mono, minWidth: 26, color: T.muted } }, String(pin.index)),
+                                  h(
+                                    'span',
+                                    {
+                                      style: { fontFamily: T.mono, minWidth: pin.pinNumber ? 46 : 26, color: T.muted },
+                                      title: pin.pinNumber ? `pin ${pin.pinNumber} of ${pin.pinCount} · pad index ${pin.index}` : `pad index ${pin.index}`,
+                                    },
+                                    pin.pinNumber ? `${pin.pinNumber}/${pin.pinCount}` : String(pin.index),
+                                  ),
                                   h('span', { style: { fontFamily: T.mono, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, pin.net ?? '—'),
                                 ),
                               ),

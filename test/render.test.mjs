@@ -95,6 +95,24 @@ check('net wiring and pads stay on by default', () => {
   assert.match(client, /showNetWiring: true,/)
 })
 
+console.log('\nIC pin numbering')
+
+check('IC pins are numbered 1..N from the package corner', () => {
+  assert.match(client, /function numberedPins\(pins\)/)
+  assert.match(client, /pins\.length < 6\) return pins/, 'small parts must keep their pad index')
+  assert.match(client, /const start = Math\.PI \* 0\.75/)
+  assert.match(client, /pinNumber: position \+ 1, pinCount: ordered\.length/)
+})
+
+check('the inspector and the canvas label a pin with the same number', () => {
+  assert.match(client, /return numberedPins\(pins\)/, 'the inspector must use the shared numbering')
+  assert.match(client, /const numbered = numberedPins\(partPins\)/, 'the canvas must use the shared numbering')
+  assert.match(client, /fillText\(String\(pin\.pinNumber\)/, 'the canvas must draw the number')
+  // The vendor pad index stays reachable in the tooltip, because that is the
+  // identity the marks and the agent tools record.
+  assert.match(client, /pad index/, 'the pad index must stay reachable')
+})
+
 console.log('\nlocale parity')
 // A lookbehind keeps `x.get('etag')` from being read as a t() key — the
 // regex matched it and reported a missing translation for an HTTP header.
