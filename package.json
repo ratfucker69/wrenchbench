@@ -1,6 +1,6 @@
 {
   "name": "dsh-wrenchbench",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "private": true,
   "description": "WrenchBench: a board-level repair workbench in the sidebar - boardview import and canvas, per-board schematic ingestion that names anonymous rails by pin-count fingerprint, a persistent board library, and agent tools that read the same board the canvas shows.",
   "type": "module",
@@ -8,7 +8,8 @@
   "scripts": {
     "test": "node test/run-all.mjs",
     "smoke": "node smoke-live.mjs",
-    "tour": "node tour-live.mjs && node tour-extra.mjs"
+    "tour": "node tour-live.mjs && node tour-extra.mjs",
+    "ship": "node ship.mjs"
   },
   "exports": {
     ".": "./index.js",

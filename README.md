@@ -177,6 +177,27 @@ Three of those exist for a specific fault rather than for a feature:
 - **`client-board`** goes further and mounts the panel with a real board behind it: a hooks runtime (state, effects, re-render) plus `fetch` wired into the plugin's own host routes, so the rail legend, the marks and the library entries are rendered from real data. A branch that throws blanked the panel and nothing caught it — now a render fault fails the suite, and the suite carries a deliberate fault to prove it would notice.
 - **`contracts`** asserts the route contract itself: one path per route, `405` for a method a route does not implement, `413` for an oversized body, `404`/`400` for an unknown or traversing id, and that the `alias` route accepts both field names callers send. Field drift between a tool and its route was a real bug; a feature test only exercises the fields its own caller sends.
 
+## Shipping a change
+
+```bash
+npm run ship -- --message "what changed and why" --bump patch --port 60127
+```
+
+One command for the whole release step, so a finished change is never left in a
+working tree waiting for permission:
+
+| Step | Detail |
+|---|---|
+| guards | refuses outside the repository root, on a branch other than `main`, or with a rebase/merge in progress |
+| verify | `node test/run-all.mjs`, then `node smoke-live.mjs <port>` when `--port` is given |
+| version | `--bump patch\|minor\|major\|none` writes `package.json` |
+| commit | stages everything and commits with the message, written as a file so it is never mangled by a shell |
+| push | `main`, with the connected GitHub token through a throwaway askpass helper — never in a URL, an argument or a file in the repo |
+
+It prints the commit link. It never force-pushes: a refused push leaves the commit
+local and says so. `--dry-run` reports what it would do and writes nothing;
+`--skip-tests` exists for a docs-only change and nothing else.
+
 ## Contributing
 
 Pull requests are welcome. Before opening one, run the suite — it must pass:

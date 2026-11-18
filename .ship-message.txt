@@ -1,0 +1,24 @@
+ship.mjs: one command for verify, version, commit and push
+
+A finished change used to be committed by hand at the end of a turn, which is
+exactly the step that gets forgotten on a long one. `npm run ship` does the whole
+release step:
+
+- guards: refuses outside the repository root, on a branch other than main, or
+  with a rebase, merge or cherry-pick in progress;
+- verify: runs the whole suite, and the live smoke test when --port is given,
+  and ships nothing if either fails;
+- version: --bump patch|minor|major|none writes package.json;
+- commit: stages everything, writes the message to a temp file first so a shell
+  cannot mangle it, and commits;
+- push: main, with the connected token through a throwaway askpass helper, so it
+  never appears in a remote URL, an argument, a file in the repo, or this
+  command's output.
+
+It never force-pushes: a refused push leaves the commit local and says so.
+--dry-run reports what it would do and writes nothing, which is also how the
+version bump was found to happen before that check.
+
+Workspace AGENTS.md now states the standing rule this enforces: a WrenchBench
+change is not finished until it is pushed, and no change waits to be asked
+about.
