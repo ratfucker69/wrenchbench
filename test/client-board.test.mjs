@@ -109,7 +109,9 @@ store.writeFocus({ board: boardId, refdes: 'N15900', net: null, pin: null })
 store.writeRepairSession(boardId, { sessionId: 'render-session', createdAt: new Date().toISOString() })
 
 /** Fetch, routed into the host routes exactly as the browser would. */
+const fetchLog = []
 function hostFetch(url, init = {}) {
+  fetchLog.push(`${init.method ?? 'GET'} ${url}`)
   const parsed = new URL(url, 'http://127.0.0.1')
   const route = routes.find((entry) => entry.path === parsed.pathname)
   if (!route) return Promise.reject(new Error(`the client called an unknown route: ${parsed.pathname}`))
@@ -324,6 +326,16 @@ function makeHookReact() {
         const queued = tree.effects.filter((entry) => entry.queued)
         for (const entry of queued) {
           entry.queued = false
+          // React disposes the previous run before re-running an effect. Without
+          // that, the conversation poll stacks timers and the process never exits.
+          if (typeof entry.dispose === 'function') {
+            try {
+              entry.dispose()
+            } catch {
+              // A disposer that throws must not break the mount.
+            }
+            entry.dispose = undefined
+          }
           const dispose = entry.run()
           if (typeof dispose === 'function') entry.dispose = dispose
         }
@@ -429,6 +441,35 @@ function findNode(node, predicate) {
   return children === undefined ? null : findNode(children, predicate)
 }
 
+/**
+ * The conversation route needs a session service, which this harness does not
+ * have. Overriding that one route keeps the rest of the panel on real code while
+ * letting the Agent tab render a transcript and a blocked turn.
+ */
+const threadFixture = {
+  sessionId: 'render-session',
+  running: true,
+  pending: null,
+  messages: [
+    { role: 'user', text: 'which rail is Net73?', time: 1 },
+    { role: 'assistant', text: 'Net73 is VDDCR_GFX, 1.0 V.', time: 2 },
+    { role: 'tool', text: 'wrenchbench_net', time: 3 },
+  ],
+  unavailable: null,
+}
+const conversationRoute = routes.find((entry) => entry.path === '/api/dsh-wrenchbench/conversation')
+if (conversationRoute) {
+  const realHandler = conversationRoute.handler
+  conversationRoute.handler = (req, res) =>
+    /conversation/.test(req.url ?? '')
+      ? Promise.resolve().then(() => {
+          const body = JSON.stringify(threadFixture)
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body) })
+          res.end(body)
+        })
+      : realHandler(req, res)
+}
+
 let tree = null
 
 await check('the panel mounts and reaches a settled state with a board loaded', async () => {
@@ -467,6 +508,70 @@ await check('the schematic upload affordance is present for a board without one'
 await check('the export link is rendered for each board in the library', () => {
   const text = textOf(tree)
   assert.match(text, /export\?id=render-bench-0100/, 'the CSV export link is missing')
+})
+
+await check('the Agent tab draws the transcript, below the input', async () => {
+  const agentTab = findNode(tree, (node) => node.type === 'button' && node.props?.children === 'tab.agent')
+  assert.ok(agentTab, 'no Agent tab button')
+  agentTab.props.onClick()
+  tree = await runtime.mount(panel({}))
+  const text = textOf(tree)
+  assert.match(text, /which rail is Net73/, 'the question is not drawn')
+  assert.match(text, /VDDCR_GFX/, 'the answer is not drawn')
+  assert.match(text, /wrenchbench_net/, 'the tool line is not drawn')
+
+  // The transcript must sit after the textarea in document order: the answer
+  // belongs under the box the technician types in.
+  const order = []
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      node.forEach(walk)
+      return
+    }
+    if (node.type === 'textarea') order.push('input')
+    const own = node.props?.children
+    if (typeof own === 'string' && own.includes('VDDCR_GFX')) order.push('answer')
+    walk(own)
+  }
+  walk(tree)
+  assert.deepEqual(order.slice(0, 2), ['input', 'answer'], `the transcript is not below the input (${order.join(',')})`)
+})
+
+await check('a blocked turn draws its options as buttons', async () => {
+  threadFixture.pending = { question: 'Rail present?', header: 'Rail', options: ['0 V', '3.3 V', 'not reachable'] }
+  // Leave the tab and come back: the poll effect re-runs on a tab change, which
+  // is how a real panel learns about a turn that became blocked while it sat.
+  const boardTab = findNode(tree, (node) => node.type === 'button' && node.props?.children === 'tab.board')
+  assert.ok(boardTab, 'no Board tab button')
+  boardTab.props.onClick()
+  tree = await runtime.mount(panel({}))
+  const agentAgain = findNode(tree, (node) => node.type === 'button' && node.props?.children === 'tab.agent')
+  agentAgain.props.onClick()
+  tree = await runtime.mount(panel({}))
+  const text = textOf(tree)
+  assert.match(text, /Rail present\?/, 'the pending question is not drawn')
+  // The key is what makes these buttons the answer options: the same label can
+  // appear elsewhere in the panel (the rail legend offers "3.3 V" as a name).
+  const option = findNode(tree, (node) => node.type === 'button' && node.props?.key === 'opt-1')
+  assert.ok(option, 'the options are not drawn as buttons')
+  // Clicking one sends that label; the fixture records the call.
+  let sent = null
+  const askRoute = routes.find((entry) => entry.path === '/api/dsh-wrenchbench/ask')
+  const realAsk = askRoute.handler
+  askRoute.handler = (req, res) => {
+    sent = req
+    const body = JSON.stringify({ accepted: true, sessionId: 'render-session' })
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body) })
+    res.end(body)
+  }
+  // What did the panel do with the click? Errors are drawn, so look at both.
+  const clicked = option.props.onClick()
+  if (clicked && typeof clicked.then === 'function') await clicked
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  askRoute.handler = realAsk
+  assert.ok(sent, 'clicking an option sent nothing')
+  threadFixture.pending = null
 })
 
 await check('the command list is one click away and lists the gestures', async () => {
@@ -517,3 +622,6 @@ if (failures.length > 0) {
   process.exit(1)
 }
 console.log(`RENDER CHECKS PASS (${passed})`)
+// The panel polls while the Agent tab is open — a feature of the panel, not of
+// the test. End the process rather than waiting for a timer that will rearm.
+process.exit(0)

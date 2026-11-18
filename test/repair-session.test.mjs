@@ -17,7 +17,7 @@ const libraryDir = path.join(os.tmpdir(), `wrenchbench-repair-${process.pid}`)
 process.env.DSH_WRENCHBENCH_DIR = libraryDir
 
 const store = await import('../store.js')
-const { createRepairThread, transcriptOf, isHarnessMessage } = await import('../repair-session.js')
+const { createRepairThread, transcriptOf, isHarnessMessage, pendingQuestionOf } = await import('../repair-session.js')
 
 let passed = 0
 const failures = []
@@ -316,6 +316,142 @@ await checkAsync('a real listing keeps the group of a live board', () => {
 
 process.env.USERPROFILE = realHome
 process.env.HOME = realHomeLower
+
+
+console.log('\na blocked turn')
+
+await check('the pending question is read off the transcript', () => {
+  assert.equal(pendingQuestionOf([{ type: 'tool/call', data: { name: 'wrenchbench_mark', arguments: '{}' } }]), null)
+  const call = {
+    type: 'tool/call',
+    data: {
+      name: 'ask_user_question',
+      callId: 'call-1',
+      arguments: JSON.stringify({
+        questions: [{ question: 'Rail present?', header: 'Rail', options: [{ label: '0 V' }, { label: '3.3 V' }, 'not reachable'] }],
+      }),
+    },
+  }
+  const pending = pendingQuestionOf([call])
+  assert.equal(pending.question, 'Rail present?')
+  assert.deepEqual(pending.options, ['0 V', '3.3 V', 'not reachable'])
+  // A result for that call closes it again.
+  const answered = pendingQuestionOf([
+    call,
+    { type: 'tool/result', data: { message: { toolCallId: 'call-1' } } },
+  ])
+  assert.equal(answered, null)
+  // Malformed arguments are unusable, not fatal.
+  assert.equal(pendingQuestionOf([{ type: 'tool/call', data: { name: 'ask_user_question', arguments: '{oops' } }]), null)
+})
+
+await checkAsync('asking cancels a turn that is stuck on a question', async () => {
+  const calls = []
+  let running = true
+  const sticky = createRepairThread({
+    ctx: {
+      get: () => ({
+        async create() {
+          return { sessionId: 'stuck-1' }
+        },
+        async rename() {
+          return {}
+        },
+        async inspect() {
+          return { events: [{ type: 'tool/call', data: { name: 'ask_user_question', arguments: '{}' } }] }
+        },
+        async list() {
+          return { items: [{ sessionId: 'stuck-1', running }] }
+        },
+        cancel(request) {
+          calls.push(request)
+          running = false
+          return { accepted: true }
+        },
+        async prompt(request) {
+          calls.push(request)
+          return { accepted: true }
+        },
+      }),
+    },
+    root: store.dataRoot,
+    store,
+  })
+  const answer = await sticky.ask('stuck-board', 'Stuck Board', 'next question')
+  assert.equal(answer.accepted, true)
+  assert.equal(answer.cancelledPreviousTurn, true, 'the blocked turn was not cancelled')
+  assert.equal(calls[0].sessionId, 'stuck-1', 'the cancel went to the wrong session')
+  assert.equal(calls[1].content[0].text, 'next question', 'the prompt did not follow the cancel')
+})
+
+await checkAsync('an idle thread is not cancelled', async () => {
+  let cancelled = false
+  const idle = createRepairThread({
+    ctx: {
+      get: () => ({
+        async create() {
+          return { sessionId: 'idle-1' }
+        },
+        async rename() {
+          return {}
+        },
+        async list() {
+          return { items: [{ sessionId: 'idle-1', running: false }] }
+        },
+        cancel() {
+          cancelled = true
+          return { accepted: true }
+        },
+        async prompt() {
+          return { accepted: true }
+        },
+      }),
+    },
+    root: store.dataRoot,
+    store,
+  })
+  const answer = await idle.ask('idle-board', 'Idle Board', 'q')
+  assert.equal(answer.cancelledPreviousTurn, false)
+  assert.equal(cancelled, false, 'an idle thread was cancelled for no reason')
+})
+
+await checkAsync('the transcript reports the question the panel must draw', async () => {
+  const shown = createRepairThread({
+    ctx: {
+      get: () => ({
+        async create() {
+          return { sessionId: 'pending-1' }
+        },
+        async inspect() {
+          return {
+            events: [
+              { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Rail first.' }] } } },
+              {
+                type: 'tool/call',
+                data: { name: 'ask_user_question', callId: 'c9', arguments: JSON.stringify({ questions: [{ question: '0 V or 3.3 V?', options: [{ label: '0 V' }, { label: '3.3 V' }] }] }) },
+              },
+            ],
+          }
+        },
+        async list() {
+          return { items: [{ sessionId: 'pending-1', running: true }] }
+        },
+        async prompt() {
+          return { accepted: true }
+        },
+      }),
+    },
+    root: store.dataRoot,
+    store,
+  })
+  const threadView = await shown.conversation('pending-board', 'Pending Board')
+  // The answer, then one muted line for the tool it used.
+  assert.equal(threadView.messages.length, 2)
+  assert.equal(threadView.messages[0].role, 'assistant')
+  assert.match(threadView.messages[0].text, /Rail first/)
+  assert.equal(threadView.pending.question, '0 V or 3.3 V?')
+  assert.deepEqual(threadView.pending.options, ['0 V', '3.3 V'])
+})
 
 console.log('\nfailures are reported, never hidden')
 

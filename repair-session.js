@@ -92,6 +92,55 @@ export function transcriptOf(events) {
 }
 
 /**
+ * The question a blocked turn is waiting on, if there is one.
+ *
+ * A repair session has no chat UI to answer `ask_user_question`, so a turn that
+ * ends with one waits forever. The panel cannot answer the tool call either —
+ * but it can draw the options and send the chosen label as the next message,
+ * which is what the technician meant to do anyway. Detecting it here is what
+ * turns a wedged thread into a working one.
+ */
+export function pendingQuestionOf(events) {
+  let pending = null
+  for (const event of events ?? []) {
+    if (!event?.type) continue
+    if (event.type === 'tool/call') {
+      const name = String(event.data?.name ?? '')
+      if (name !== 'ask_user_question') continue
+      const args = parseArguments(event.data?.arguments)
+      const first = Array.isArray(args?.questions) ? args.questions[0] : null
+      pending = {
+        callId: event.data?.callId ?? null,
+        question: String(first?.question ?? '').trim(),
+        header: String(first?.header ?? '').trim(),
+        options: Array.isArray(first?.options)
+          ? first.options
+              .map((option) => (typeof option === 'string' ? option : String(option?.label ?? '').trim()))
+              .filter((label) => label.length > 0)
+          : [],
+      }
+      continue
+    }
+    // Any result closes the question it belongs to; a later call replaces it.
+    if (event.type === 'tool/result') {
+      const callId = event.data?.message?.toolCallId ?? event.data?.toolCallId ?? null
+      if (pending && (callId === null || pending.callId === null || String(callId) === String(pending.callId))) pending = null
+    }
+  }
+  return pending && pending.question.length > 0 ? pending : null
+}
+
+/** Tool arguments arrive as a JSON string; a malformed one is simply unusable. */
+function parseArguments(raw) {
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+/**
  * Own the per-board repair session.
  *
  * @param {object} options
@@ -213,6 +262,14 @@ export function createRepairThread({ ctx, root, store }) {
    * already in the agent's system prompt, so no `[WrenchBench]` context lines
    * are mixed into the technician's words — which also keeps the transcript the
    * panel draws exactly what they typed.
+   *
+   * A bench thread can be blocked. The interview brief tells the agent to end a
+   * turn with a question, and `ask_user_question` waits for an answer that only a
+   * chat UI can give — there is no such UI for a repair session, so the turn sits
+   * there, `running` stays true forever and every later question queues behind it
+   * and never runs. A blocked turn is therefore cancelled before the new question
+   * is admitted: the previous answer is already in the transcript, and the
+   * technician's click on an option (or their next message) is the answer.
    */
   async function ask(boardId, boardName, question) {
     const service = controller()
@@ -234,6 +291,8 @@ export function createRepairThread({ ctx, root, store }) {
             : `WrenchBench could not open a repair session (${thread.detail ?? thread.error}).`,
       }
     }
+
+    const unblocked = await clearBlockedTurn(service, thread.sessionId)
 
     const abort = new AbortController()
     const timer = setTimeout(() => abort.abort(), 60000)
@@ -257,7 +316,67 @@ export function createRepairThread({ ctx, root, store }) {
     } finally {
       clearTimeout(timer)
     }
-    return { accepted: true, sessionId: thread.sessionId }
+    return { accepted: true, sessionId: thread.sessionId, cancelledPreviousTurn: unblocked }
+  }
+
+  /**
+   * Cancel a running turn so the thread can accept a new question.
+   *
+   * Returns true when a turn was actually cancelled. Never throws: a thread that
+   * cannot be cancelled still gets the prompt admitted, and the queue does the
+   * rest when the blocked turn is ended by the host.
+   */
+  async function clearBlockedTurn(service, sessionId) {
+    if (typeof service.cancel !== 'function') return false
+    const running = await isRunning(service, sessionId)
+    if (!running) return false
+    try {
+      service.cancel({ sessionId })
+    } catch {
+      return false
+    }
+    // Give the turn a moment to actually end; the prompt is worth admitting even
+    // if it queues, so this is a wait, not a gate.
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      if (!(await isRunning(service, sessionId))) return true
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    }
+    return true
+  }
+
+  /** True when the session service reports a live turn for this session. */
+  async function isRunning(service, sessionId) {
+    if (typeof service.list !== 'function') return false
+    try {
+      const listed = await service.list({})
+      const row = (listed?.items ?? []).find((item) => String(item.sessionId) === String(sessionId))
+      return row?.running === true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * End the thread's active turn without dropping what is queued behind it.
+   *
+   * The panel offers this because a bench turn can be waiting on something no
+   * panel can supply; the technician needs a way out that is not "reload and
+   * hope", and a cancelled turn still leaves the answer that already arrived.
+   */
+  async function cancel(boardId) {
+    const service = controller()
+    if (!service || typeof service.cancel !== 'function') {
+      return { cancelled: false, reason: 'no-session-service' }
+    }
+    const existing = readId(boardId)
+    if (!existing) return { cancelled: false, reason: 'no-thread' }
+    if (!(await isRunning(service, existing))) return { cancelled: false, reason: 'idle' }
+    try {
+      service.cancel({ sessionId: existing })
+    } catch (error) {
+      return { cancelled: false, reason: 'cancel-failed', detail: error instanceof Error ? error.message : String(error) }
+    }
+    return { cancelled: true, sessionId: existing }
   }
 
   /** The thread as the panel draws it. */
@@ -269,10 +388,14 @@ export function createRepairThread({ ctx, root, store }) {
 
     let messages = []
     let running = false
+    let pending = null
     if (typeof service.inspect === 'function') {
       try {
         const inspected = await service.inspect(thread.sessionId)
         messages = transcriptOf(inspected?.events)
+        // A turn waiting on an unanswerable question is the one state the panel
+        // must draw differently: it needs the options, not a spinner.
+        pending = pendingQuestionOf(inspected?.events)
       } catch {
         // A session that has not been written yet is simply empty.
       }
@@ -286,7 +409,7 @@ export function createRepairThread({ ctx, root, store }) {
         // Running state is advisory; the transcript still draws.
       }
     }
-    return { messages, running, sessionId: thread.sessionId }
+    return { messages, running, pending, sessionId: thread.sessionId }
   }
 
   /**
@@ -411,5 +534,5 @@ export function createRepairThread({ ctx, root, store }) {
     return swept
   }
 
-  return { ensure, reset, ask, conversation, forget, sweep, transcriptOf }
+  return { ensure, reset, ask, cancel, conversation, forget, sweep, transcriptOf }
 }

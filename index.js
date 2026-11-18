@@ -2150,7 +2150,13 @@ function createRoutes(ctx, config) {
         const question = String(body.question ?? '').trim()
         if (question.length === 0) return fail(res, 400, 'a question is required')
 
-        const loaded = loadBoard(body.board)
+        // The board comes from the request. Falling back to the focused board
+        // would post a question about one board into another board's thread.
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const requested = String(url.searchParams.get('id') ?? body.board ?? '').trim()
+        if (requested.length === 0) return fail(res, 400, 'a board id is required')
+        if (!store.isBoardId(requested)) return fail(res, 400, 'a valid board id is required')
+        const loaded = loadBoard(requested)
         if (loaded.error) return fail(res, 404, loaded.error)
         const { meta } = loaded
 
@@ -2164,6 +2170,30 @@ function createRoutes(ctx, config) {
           })
         }
         return sendJson(res, 200, { accepted: true, sessionId: answer.sessionId })
+      } catch (error) {
+        return fail(res, 500, error instanceof Error ? error.message : String(error))
+      }
+    },
+  })
+
+  routes.push({
+    kind: 'exact',
+    path: `${ROUTE}/cancel`,
+    handler: async (req, res) => {
+      if (req.method !== 'POST') return fail(res, 405, 'method not allowed')
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      let body = {}
+      try {
+        body = await readJsonBody(req, 8 * 1024)
+      } catch (error) {
+        return fail(res, error?.statusCode ?? 400, error instanceof Error ? error.message : String(error))
+      }
+      const id = String(url.searchParams.get('id') ?? body?.board ?? '').trim()
+      if (!store.isBoardId(id)) return fail(res, 400, 'a valid board id is required')
+      if (!store.readMeta(id)) return fail(res, 404, 'that board is not in the library')
+      try {
+        const result = await repairThread.cancel(id)
+        return sendJson(res, 200, result)
       } catch (error) {
         return fail(res, 500, error instanceof Error ? error.message : String(error))
       }

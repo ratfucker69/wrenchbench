@@ -1849,6 +1849,10 @@ window.__ModuleLoader__.load({
               setThread({
                 messages: Array.isArray(body?.messages) ? body.messages : [],
                 running: body?.running === true,
+                // A blocked turn carries the question the panel must draw. This
+                // rebuild of the thread state once dropped it, which made a
+                // wedged thread look like a panel that refused to show anything.
+                pending: body?.pending ?? null,
                 sessionId: body?.sessionId ?? null,
                 unavailable: body?.unavailable ?? null,
               })
@@ -1884,15 +1888,29 @@ window.__ModuleLoader__.load({
             }
           }, [activeId, tab, loadThread, askState.status, thread.running])
 
+          // The board the conversation belongs to. `activeId` is the library
+          // selection and the loaded payload carries the id that was actually
+          // fetched; a panel that drew a board while the selection was empty used
+          // to make Send do nothing at all, silently, because the handler
+          // returned the moment activeId was falsy.
+          const boardId = activeId ?? doc?.meta?.id ?? null
+
           // --- ask the agent -------------------------------------------------
-          const askAgent = React.useCallback(async () => {
-            const question = askText.trim()
-            if (question.length === 0 || !activeId) return
+          // Accepts an explicit text so an option button can send its label
+          // without going through the textarea. A click event is not a string
+          // and is ignored, which is what keeps onClick={askAgent} working.
+          const askAgent = React.useCallback(async (override) => {
+            const question = (typeof override === 'string' ? override : askText).trim()
+            if (question.length === 0) return
+            if (!boardId) {
+              setAskState({ status: 'error', message: t('agent.noBoard'), sessionId: null })
+              return
+            }
             setAskState({ status: 'sending', message: '', sessionId: null })
             try {
               const body = await sendJson(`${ROUTE}/ask`, 'POST', {
                 question,
-                board: activeId,
+                board: boardId,
                 refdes: selection.refdes ?? undefined,
               })
               if (body?.accepted) {
@@ -1904,7 +1922,7 @@ window.__ModuleLoader__.load({
                   sessionId: body.sessionId ?? existing.sessionId,
                   messages: [...existing.messages, { role: 'user', text: question, time: Date.now() }],
                 }))
-                loadThread(activeId)
+                loadThread(boardId)
               } else {
                 setAskState({
                   status: 'no-session',
@@ -1915,7 +1933,7 @@ window.__ModuleLoader__.load({
             } catch (error) {
               setAskState({ status: 'error', message: error instanceof Error ? error.message : String(error), sessionId: null })
             }
-          }, [askText, activeId, selection.refdes, loadThread])
+          }, [askText, boardId, selection.refdes, loadThread, setAskState, setThread, t])
 
           const newThread = React.useCallback(async () => {
             if (!activeId) return
@@ -3887,6 +3905,18 @@ window.__ModuleLoader__.load({
               )
             : h('div', { style: { fontSize: 12, color: T.muted } }, t('inspector.none'))
 
+          const cancelTurn = React.useCallback(async () => {
+            if (!boardId) return
+            try {
+              const body = await sendJson(`${ROUTE}/cancel?id=${encodeURIComponent(boardId)}`, 'POST', { board: boardId })
+              if (body?.cancelled) setNotice(t('agent.cancelled'))
+              else if (body?.reason === 'idle') setNotice(t('agent.alreadyIdle'))
+              loadThread(boardId)
+            } catch (error) {
+              setNotice(error instanceof Error ? error.message : String(error))
+            }
+          }, [boardId, loadThread, setNotice, t])
+
           const agentPane = h(
             'div',
             { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, flex: 1 } },
@@ -3911,6 +3941,106 @@ window.__ModuleLoader__.load({
                 t('agent.newThread'),
               ),
             ),
+            h('textarea', {
+              value: askText,
+              onChange: (event) => setAskText(event.currentTarget.value),
+              placeholder: t('agent.placeholder'),
+              rows: 3,
+              style: {
+                width: '100%',
+                boxSizing: 'border-box',
+                resize: 'vertical',
+                fontSize: 12.5,
+                padding: '7px 8px',
+                borderRadius: 9,
+                border: T.border,
+                background: 'transparent',
+                color: 'inherit',
+                fontFamily: 'inherit',
+                lineHeight: 1.45,
+              },
+            }),
+            h(
+              'div',
+              { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  onClick: askAgent,
+                  disabled: askState.status === 'sending' || askText.trim().length === 0 || !board,
+                  style: {
+                    ...BUTTON,
+                    background: T.brand,
+                    borderColor: 'transparent',
+                    color: 'var(--dsw-alias-bg-base, #ffffff)',
+                    fontWeight: 600,
+                    padding: '6px 14px',
+                  },
+                },
+                askState.status === 'sending' ? t('agent.sending') : t('agent.send'),
+              ),
+              selection.refdes
+                ? h('span', { style: { fontSize: 11, color: T.muted, fontFamily: T.mono } }, `→ ${selection.refdes}`)
+                : null,
+            ),
+            askState.status === 'sent'
+              ? h('div', { style: { fontSize: 11, color: T.muted } }, t('agent.sent'))
+              : null,
+            askState.status === 'no-session'
+              ? h('div', { style: { fontSize: 12, color: T.muted } }, t('agent.noSession'))
+              : null,
+            askState.status === 'error'
+              ? h('div', { style: { fontSize: 12, color: T.danger } }, askState.message)
+              : null,
+            // A turn stopped on a question it cannot ask the host for an answer
+            // to: draw the options, because clicking one IS the answer.
+            thread.pending
+              ? h(
+                  'div',
+                  {
+                    style: {
+                      border: T.border,
+                      borderRadius: 9,
+                      padding: '7px 8px',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 5,
+                      background: 'color-mix(in srgb, currentColor 4%, transparent)',
+                    },
+                  },
+                  h('div', { style: { fontSize: 10.5, color: T.muted, textTransform: 'uppercase', letterSpacing: 0.3 } }, t('agent.waitingOnYou')),
+                  h('div', { style: { fontSize: 12, lineHeight: 1.45 } }, thread.pending.question),
+                  h(
+                    'div',
+                    { style: { display: 'flex', gap: 5, flexWrap: 'wrap' } },
+                    (thread.pending.options ?? []).map((label, index) =>
+                      h(
+                        'button',
+                        {
+                          key: `opt-${index}`,
+                          type: 'button',
+                          onClick: () => askAgent(label),
+                          style: { ...BUTTON, padding: '3px 9px', fontSize: 11 },
+                        },
+                        label,
+                      ),
+                    ),
+                  ),
+                )
+              : null,
+            thread.running && !thread.pending
+              ? h(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                  h('div', { style: { fontSize: 10.5, color: T.muted, fontFamily: T.mono } }, t('agent.thinking')),
+                  h(
+                    'button',
+                    { type: 'button', onClick: cancelTurn, style: { ...BUTTON, padding: '2px 8px', fontSize: 10 } },
+                    t('agent.cancelTurn'),
+                  ),
+                )
+              : null,
             // The conversation is WrenchBench's own session, drawn here so the
             // technician never sees a workspace chat for a bench question.
             h(
@@ -3974,58 +4104,6 @@ window.__ModuleLoader__.load({
                 : null,
               h('div', { ref: threadEndRef }),
             ),
-            h('textarea', {
-              value: askText,
-              onChange: (event) => setAskText(event.currentTarget.value),
-              placeholder: t('agent.placeholder'),
-              rows: 3,
-              style: {
-                width: '100%',
-                boxSizing: 'border-box',
-                resize: 'vertical',
-                fontSize: 12.5,
-                padding: '7px 8px',
-                borderRadius: 9,
-                border: T.border,
-                background: 'transparent',
-                color: 'inherit',
-                fontFamily: 'inherit',
-                lineHeight: 1.45,
-              },
-            }),
-            h(
-              'div',
-              { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-              h(
-                'button',
-                {
-                  type: 'button',
-                  onClick: askAgent,
-                  disabled: askState.status === 'sending' || askText.trim().length === 0 || !board,
-                  style: {
-                    ...BUTTON,
-                    background: T.brand,
-                    borderColor: 'transparent',
-                    color: 'var(--dsw-alias-bg-base, #ffffff)',
-                    fontWeight: 600,
-                    padding: '6px 14px',
-                  },
-                },
-                askState.status === 'sending' ? t('agent.sending') : t('agent.send'),
-              ),
-              selection.refdes
-                ? h('span', { style: { fontSize: 11, color: T.muted, fontFamily: T.mono } }, `→ ${selection.refdes}`)
-                : null,
-            ),
-            askState.status === 'sent'
-              ? h('div', { style: { fontSize: 11, color: T.muted } }, t('agent.sent'))
-              : null,
-            askState.status === 'no-session'
-              ? h('div', { style: { fontSize: 12, color: T.muted } }, t('agent.noSession'))
-              : null,
-            askState.status === 'error'
-              ? h('div', { style: { fontSize: 12, color: T.danger } }, askState.message)
-              : null,
             h('div', { style: { height: 1, background: T.muted, opacity: 0.2 } }),
             inspector,
           )
