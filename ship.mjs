@@ -86,8 +86,19 @@ for (const inProgress of ['rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_
 const branch = git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim()
 if (branch !== 'main') fail(`on branch "${branch}"; this ships main`)
 
-const body = message ?? fs.readFileSync(path.resolve(repoRoot, messageFile), 'utf8').trim()
-if (body.length < 8) fail('the message is too short to be a record of the change')
+let body = message
+if (!body && messageFile) {
+  const resolved = path.resolve(repoRoot, messageFile)
+  body = fs.readFileSync(resolved, 'utf8').trim()
+  // A message file inside the repository is transient by nature: this command
+  // stages everything, so it would be committed as part of the change it
+  // describes. Read it, then consume it.
+  if (resolved.startsWith(repoRoot + path.sep)) {
+    fs.rmSync(resolved, { force: true })
+    console.log(`ship: consumed the message file ${path.relative(repoRoot, resolved)}`)
+  }
+}
+if (!body || body.length < 8) fail('the message is too short to be a record of the change')
 
 const status = git('status', '--porcelain').stdout.trim()
 if (status.length === 0 && bump === 'none') fail('nothing to ship')
