@@ -104,12 +104,18 @@ check(
   asked.json?.accepted === true && typeof asked.json?.sessionId === 'string',
   asked.text.slice(0, 240),
 )
-// The user message lands when the turn starts, so give the agent a moment.
+// The user message lands when the turn starts, and this is the same bench thread
+// the technician is using, so a turn may already be in flight: cancel it, then
+// allow real time for the queue rather than a few seconds.
 let conversation = await get(`/conversation?id=${boardId}`)
-for (let attempt = 0; attempt < 12; attempt += 1) {
+if (conversation.json?.running === true) {
+  await post(`/cancel?id=${boardId}`, {})
+  await new Promise((resolve) => setTimeout(resolve, 600))
+}
+for (let attempt = 0; attempt < 40; attempt += 1) {
   const messages = conversation.json?.messages ?? []
   if (messages.some((message) => message.role === 'user' && /which rail is Net73/.test(message.text))) break
-  await new Promise((resolve) => setTimeout(resolve, 700))
+  await new Promise((resolve) => setTimeout(resolve, 750))
   conversation = await get(`/conversation?id=${boardId}`)
 }
 check('the panel can read the conversation back', conversation.status === 200 && Array.isArray(conversation.json?.messages), conversation.text.slice(0, 200))

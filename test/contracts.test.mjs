@@ -259,6 +259,30 @@ await checkAsync('the bench export is a CSV carrying every rail and every part',
   if (!parts.every((row) => /^"?\d+"?$/.test(row[3]))) throw new Error('a part row has no pad count')
 })
 
+await checkAsync('the plain-language search route answers in meaning, not labels', async () => {
+  // The fixture's biggest part is R1? No — C1/R1 are two pads each, so "cpu"
+  // must still resolve to something rather than failing.
+  const answer = await call('/api/dsh-wrenchbench/search', { url: `/api/dsh-wrenchbench/search?id=${boardId}&q=cpu` })
+  if (answer.status !== 200) throw new Error(`${answer.status} ${answer.text.slice(0, 120)}`)
+  const body = JSON.parse(answer.text)
+  if (body.understood !== true) throw new Error('"cpu" was not understood')
+  if (!Array.isArray(body.parts)) throw new Error('no parts array')
+  const rail = await call('/api/dsh-wrenchbench/search', { url: `/api/dsh-wrenchbench/search?id=${boardId}&q=rail` })
+  const railBody = JSON.parse(rail.text)
+  if (!Array.isArray(railBody.nets)) throw new Error('rail search returned no nets')
+  const broken = await call('/api/dsh-wrenchbench/search', { url: '/api/dsh-wrenchbench/search?id=../../etc&q=cpu' })
+  if (broken.status !== 400) throw new Error(`a traversing id answered ${broken.status}`)
+  const missing = await call('/api/dsh-wrenchbench/search', { url: '/api/dsh-wrenchbench/search?id=no-such-board&q=cpu' })
+  if (missing.status !== 404) throw new Error(`an unknown board answered ${missing.status}`)
+})
+
+await checkAsync('a word the board cannot have comes back understood but empty', async () => {
+  const answer = await call('/api/dsh-wrenchbench/search', { url: `/api/dsh-wrenchbench/search?id=${boardId}&q=fuse` })
+  const body = JSON.parse(answer.text)
+  if (body.parts.length !== 0) throw new Error('a family this board lacks returned parts anyway')
+  if (!body.notes || body.notes.length === 0) throw new Error('nothing explained the empty result')
+})
+
 console.log('\ntool/route parity')
 
 check('every tool a route backs uses the documented parameter names', () => {

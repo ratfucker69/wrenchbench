@@ -130,6 +130,80 @@ export function pendingQuestionOf(events) {
   return pending && pending.question.length > 0 ? pending : null
 }
 
+/**
+ * Detect a turn that can never finish.
+ *
+ * The runner stops at the end of a turn, so a log whose last `turn/start` has no
+ * `turn/end` is not "running" — and a cancelled turn whose tool call was never
+ * answered stays exactly that way. Nothing is live to cancel, and every prompt
+ * admitted afterwards is queued behind a turn that will never end: the panel
+ * looks like it swallows messages. A dangling tool call is the same fault in a
+ * narrower form, and it is what a bench `ask_user_question` leaves behind when
+ * the technician answers by typing rather than by clicking an option.
+ *
+ * Both are read off the log itself, never off `running`, because `running` is
+ * false in exactly the state this has to catch.
+ */
+export function wedgedOf(events) {
+  const turns = new Map()
+  const dangling = new Set()
+  let open = null
+  for (const event of events ?? []) {
+    if (!event?.type) continue
+    const turn = Number.isFinite(event.data?.turn) ? event.data.turn : null
+    if (event.type === 'turn/start') {
+      turns.set(turn, { steps: 0, ended: false, failure: null })
+      open = turn
+      dangling.clear()
+      continue
+    }
+    if (event.type === 'turn/end') {
+      const row = turns.get(turn)
+      if (row) {
+        row.ended = true
+        row.failure = event.data?.reason?.kind === 'error' ? event.data.reason.error?.message ?? 'error' : null
+      }
+      if (open === turn) open = null
+      continue
+    }
+    if (event.type === 'step/start') {
+      const row = turns.get(turn)
+      if (row) row.steps += 1
+      continue
+    }
+    if (event.type === 'tool/call') {
+      const callId = String(event.data?.callId ?? '')
+      if (callId.length > 0) dangling.add(callId)
+      continue
+    }
+    if (event.type === 'tool/result') {
+      const callId = String(event.data?.message?.toolCallId ?? event.data?.toolCallId ?? '')
+      if (callId.length > 0) dangling.delete(callId)
+      continue
+    }
+  }
+  const calls = [...dangling]
+  if (open !== null) return { reason: 'open-turn', turn: open, failedTurns: 0, danglingCalls: calls }
+  // A turn that ended with an error before taking a step is the failure this
+  // exists to catch: the prompt that opened it was not answered and never landed
+  // in the transcript. Nothing is running and nothing is thrown at the panel — it
+  // simply looks like it drops what the technician types, which is what it did.
+  // A *cancelled* turn is excluded on purpose: the technician pressing Stop also
+  // leaves a turn with no step, and that thread is healthy.
+  const failed = [...turns.values()].filter((row) => row.ended && row.steps === 0 && row.failure)
+  if (failed.length > 0) {
+    return {
+      reason: 'failed-turn',
+      turn: null,
+      failedTurns: failed.length,
+      failure: failed[failed.length - 1].failure,
+      danglingCalls: calls,
+    }
+  }
+  if (calls.length > 0) return { reason: 'dangling-call', turn: null, failedTurns: 0, danglingCalls: calls }
+  return null
+}
+
 /** Tool arguments arrive as a JSON string; a malformed one is simply unusable. */
 function parseArguments(raw) {
   if (typeof raw !== 'string' || raw.trim().length === 0) return null
@@ -263,13 +337,14 @@ export function createRepairThread({ ctx, root, store }) {
    * are mixed into the technician's words — which also keeps the transcript the
    * panel draws exactly what they typed.
    *
-   * A bench thread can be blocked. The interview brief tells the agent to end a
-   * turn with a question, and `ask_user_question` waits for an answer that only a
-   * chat UI can give — there is no such UI for a repair session, so the turn sits
-   * there, `running` stays true forever and every later question queues behind it
-   * and never runs. A blocked turn is therefore cancelled before the new question
-   * is admitted: the previous answer is already in the transcript, and the
-   * technician's click on an option (or their next message) is the answer.
+   * A bench thread can be blocked, and there are two versions of it. The first is
+   * a turn still live on the runner — the interview brief tells the agent to end a
+   * turn with a question, and `ask_user_question` waits for an answer only a chat
+   * UI can give. The second is worse: a turn that died without closing (the runner
+   * exited, or the call was interrupted), which reports `running: false` and yet
+   * still swallows every prompt admitted after it. Both are cleared first — a live
+   * turn by `cancel`, a dead one by forking the log past it, so that the transcript
+   * the technician is reading survives.
    */
   async function ask(boardId, boardName, question) {
     const service = controller()
@@ -292,7 +367,31 @@ export function createRepairThread({ ctx, root, store }) {
       }
     }
 
+    // A turn still live on the runner is ended first, so the new question does not
+    // queue behind work that only a chat UI could finish.
     const unblocked = await clearBlockedTurn(service, thread.sessionId)
+
+    // Then the log is checked for a turn that is already dead but never closed.
+    // Forking past it keeps the transcript and lets the harness synthesise the
+    // closers; without a fork service the thread is replaced instead, which loses
+    // the history but not the bench.
+    const events = await inspectEvents(service, thread.sessionId)
+    const wedge = wedgedOf(events)
+    let recovery = null
+    if (wedge) {
+      const forked = await forkThread(service, thread.sessionId, events)
+      if (forked) {
+        thread.sessionId = forked
+        saveId(boardId, forked, { name: boardName ?? null, at: new Date().toISOString() })
+        recovery = 'forked'
+      } else {
+        const replaced = await create(boardId, boardName)
+        if (!replaced.error) {
+          thread.sessionId = replaced.sessionId
+          recovery = 'replaced'
+        }
+      }
+    }
 
     const abort = new AbortController()
     const timer = setTimeout(() => abort.abort(), 60000)
@@ -316,7 +415,55 @@ export function createRepairThread({ ctx, root, store }) {
     } finally {
       clearTimeout(timer)
     }
-    return { accepted: true, sessionId: thread.sessionId, cancelledPreviousTurn: unblocked }
+    return {
+      accepted: true,
+      sessionId: thread.sessionId,
+      cancelledPreviousTurn: unblocked,
+      recovered: recovery,
+    }
+  }
+
+  /**
+   * The session log, or an empty list when it cannot be read.
+   *
+   * Every decision below is made from events rather than from `running`: the state
+   * that swallows prompts reports itself as idle.
+   */
+  async function inspectEvents(service, sessionId) {
+    if (typeof service.inspect !== 'function') return []
+    try {
+      const inspected = await service.inspect(sessionId)
+      return Array.isArray(inspected?.events) ? inspected.events : []
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * Fork a dead thread past its open turn, keeping the transcript.
+   *
+   * The fork boundary is pinned to the last event rather than left to the default
+   * "latest completed turn", because a wedged log may have no completed turn at
+   * all: the default would hand back an empty session and quietly drop the repair
+   * conversation. An open cut is closed by the harness with synthetic closers, so
+   * the forked session starts with a turn that can actually end.
+   *
+   * Returns the new session id, or null when this profile cannot fork.
+   */
+  async function forkThread(service, sessionId, events) {
+    if (typeof service.fork !== 'function') return null
+    const last = events?.length ? events[events.length - 1]?.seq : undefined
+    const request = { sessionId }
+    if (Number.isFinite(last)) request.atSeq = last
+    try {
+      const made = await service.fork(request)
+      const forked = made?.sessionId
+      if (!forked) return null
+      if (String(forked) === String(sessionId)) return null
+      return forked
+    } catch {
+      return null
+    }
   }
 
   /**
@@ -389,6 +536,7 @@ export function createRepairThread({ ctx, root, store }) {
     let messages = []
     let running = false
     let pending = null
+    let wedge = null
     if (typeof service.inspect === 'function') {
       try {
         const inspected = await service.inspect(thread.sessionId)
@@ -396,6 +544,9 @@ export function createRepairThread({ ctx, root, store }) {
         // A turn waiting on an unanswerable question is the one state the panel
         // must draw differently: it needs the options, not a spinner.
         pending = pendingQuestionOf(inspected?.events)
+        // A dead-but-unclosed turn is the other: nothing is running, and yet the
+        // next question would vanish, so the panel has to say so.
+        wedge = wedgedOf(inspected?.events)
       } catch {
         // A session that has not been written yet is simply empty.
       }
@@ -409,11 +560,26 @@ export function createRepairThread({ ctx, root, store }) {
         // Running state is advisory; the transcript still draws.
       }
     }
-    return { messages, running, pending, sessionId: thread.sessionId }
+    return {
+      messages,
+      running,
+      pending,
+      wedged: Boolean(pending) || Boolean(wedge),
+      openTurn: wedge?.turn ?? null,
+      sessionId: thread.sessionId,
+    }
   }
 
   /**
-   * Remove the thread for a board that is being deleted.
+   * Remove the thread for a board that is being deleted for good.
+   *
+   * Not for the reversible delete: a board that moves to the trash can come back,
+   * and its thread must come back with it. Calling this from there deleted the
+   * thread's session log while the board was still restorable, and the restored
+   * board then admitted prompts into a session whose log file no longer existed:
+   * every turn died with ENOENT before taking a step, so the panel accepted a
+   * message and drew nothing, for ever. Trashed boards count as live in `sweep`
+   * for the same reason.
    *
    * The board directory goes with the board, so the id file goes with it; what
    * is left behind is this module's own session directory and the harness's
@@ -429,8 +595,8 @@ export function createRepairThread({ ctx, root, store }) {
     } catch {
       // Left behind; the sweep below will try again next start.
     }
-    // The caller must hand over the id it read before the board moved to the
-    // trash: once the board directory is gone the record is gone with it, and
+    // The caller must hand over the id it read before the board was removed: once
+    // the board directory is gone the record is gone with it, and
     // reading it here silently skipped the harness session — which is how ten
     // orphan session groups were left behind by the feature tour.
     const stored = knownSessionId ?? readId(boardId)

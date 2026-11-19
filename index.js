@@ -28,6 +28,7 @@ import { createRepairThread } from './repair-session.js'
 import { createHash } from 'node:crypto'
 import { classifyParts, displayRefdes, isPlaceholderRefdes, planNaming } from './naming.js'
 import { resolveQuery } from './resolve.js'
+import { resolveColloquial } from './synonyms.js'
 import { nextChecks } from './diagnose.js'
 import * as store from './store.js'
 
@@ -839,6 +840,28 @@ function buildTools(ctx, config) {
       if (needle.length === 0) return { text: 'Provide a query to search for.', isError: true }
       const limit = Math.min(Math.max(Number(args?.limit) || 20, 1), 200)
 
+      // The words a technician uses are not in the file: this export labels
+      // parts N14142 and nets Net537. Resolve meaning first, substring second.
+      const colloquial = resolveColloquial(args?.query, {
+        board,
+        rails: (() => {
+          try {
+            return assignComponentRails(board, { aliases: railAliasesFor(meta.id, board, store.readSchematic(meta.id)) }).rails
+          } catch {
+            return classifyRails(board).rails
+          }
+        })(),
+        marks: store.readObservations(meta.id),
+        aliases,
+      })
+      if (colloquial.understood && (colloquial.parts.length > 0 || colloquial.nets.length > 0)) {
+        const lines = [`"${args?.query}" understood as: ${colloquial.roles.join(', ')}`]
+        for (const hit of colloquial.nets.slice(0, limit)) lines.push(`net ${hit.net} — ${hit.reason}`)
+        for (const hit of colloquial.parts.slice(0, limit)) lines.push(`part ${hit.refdes} — ${hit.reason}`)
+        for (const note of colloquial.notes) lines.push(`note: ${note}`)
+        return { text: lines.join('\n') }
+      }
+
       // A part matches on either name: the boardview's label or the alias the
       // schematic supplied, so the technician can search for whichever they know.
       const labelOf = (part) => aliases[part.refdes]?.alias ?? part.refdes
@@ -1559,8 +1582,14 @@ function createRoutes(ctx, config) {
   // One repair thread per board, owned here and drawn by the panel.
   const repairThread = createRepairThread({ ctx, root: store.dataRoot, store })
   // Threads for boards that no longer exist are dropped here, so a bench that
-  // has deleted a hundred projects does not carry a hundred sessions.
-  repairThread.sweep(store.listBoards().map((board) => board.id))
+  // has deleted a hundred projects does not carry a hundred sessions. Trashed
+  // boards count as live: the delete is undoable, and sweeping its thread would
+  // leave the restored board prompting into a session log that no longer exists.
+  const liveBoardIds = [
+    ...store.listBoards().map((board) => board.id),
+    ...store.listTrash().map((entry) => entry.id),
+  ]
+  repairThread.sweep(liveBoardIds)
 
   // --- library listing -----------------------------------------------------
   routes.push({
@@ -1662,17 +1691,19 @@ function createRoutes(ctx, config) {
       if (req.method === 'DELETE') {
         // A board carries labels, volts, marks and its schematic, so deleting is
         // reversible: it moves to the trash and comes back whole from the undo
-        // the panel offers.
-        const threadId = store.readRepairSession(id)
+        // the panel offers. Its repair thread is deliberately NOT removed here —
+        // this used to call `forget`, which deleted the thread's session log while
+        // the board was still restorable, and a restored board then prompted into a
+        // session whose log file was gone: every later turn failed with ENOENT
+        // before it could take a step, so the panel accepted a message and drew
+        // nothing, forever. The thread is left in place; a board that is gone for
+        // good loses it to the start-up sweep instead.
         const trashed = store.deleteBoard(id)
-        // Hand over the thread id read before the delete: the board record goes
-      // with the trash, so a later read would find nothing to clean up.
-      if (trashed) await repairThread.forget(id, threadId?.sessionId ?? null)
         return sendJson(
           res,
           trashed ? 200 : 404,
           trashed
-            ? { removed: true, trash: trashed, thread: threadId ? 'removed' : null, restore: `${ROUTE}/board/restore` }
+            ? { removed: true, trash: trashed, thread: 'kept', restore: `${ROUTE}/board/restore` }
             : { error: 'no such board' },
         )
       }
@@ -2170,6 +2201,53 @@ function createRoutes(ctx, config) {
           })
         }
         return sendJson(res, 200, { accepted: true, sessionId: answer.sessionId })
+      } catch (error) {
+        return fail(res, 500, error instanceof Error ? error.message : String(error))
+      }
+    },
+  })
+
+  routes.push({
+    kind: 'exact',
+    path: `${ROUTE}/search`,
+    handler: (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const id = url.searchParams.get('id') ?? ''
+      if (!store.isBoardId(id)) return fail(res, 400, 'a valid board id is required')
+      const loaded = store.readBoard(id)
+      if (!loaded) return fail(res, 404, 'that board is not in the library')
+      const query = url.searchParams.get('q') ?? ''
+      const aliases = store.readAliases(id)
+      const schematic = store.readSchematic(id)
+      try {
+        // One resolver, used by the panel and by the agent tool: two copies of a
+        // synonym table is how the alias field drift happened.
+        const answer = resolveColloquial(query, {
+          board: loaded.board,
+          rails: (() => {
+            try {
+              const schematicAliases = railAliasesFor(id, loaded.board, schematic)
+              const model = assignComponentRails(loaded.board, { aliases: schematicAliases })
+              applyRailLabels(model.rails, store.readRailLabels(id))
+              ensureLabelledRails(loaded.board, model.rails, store.readRailLabels(id))
+              return model.rails
+            } catch {
+              return []
+            }
+          })(),
+          marks: store.readObservations(id),
+          aliases,
+          distance: (a, b) => {
+            const parts = loaded.board.parts ?? []
+            const one = parts[a]?.bbox
+            const two = parts[b]?.bbox
+            if (!one || !two) return undefined
+            const dx = (one.x1 + one.x2) / 2 - (two.x1 + two.x2) / 2
+            const dy = (one.y1 + one.y2) / 2 - (two.y1 + two.y2) / 2
+            return Math.sqrt(dx * dx + dy * dy) * mmPerUnit(config, loaded.board)
+          },
+        })
+        return sendJson(res, 200, answer)
       } catch (error) {
         return fail(res, 500, error instanceof Error ? error.message : String(error))
       }

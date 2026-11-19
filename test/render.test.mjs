@@ -113,6 +113,32 @@ check('the inspector and the canvas label a pin with the same number', () => {
   assert.match(client, /pad index/, 'the pad index must stay reachable')
 })
 
+console.log('\nchat usability')
+
+check('Enter sends, Shift+Enter is a newline', () => {
+  assert.match(client, /onKeyDown: \(event\) => \{/)
+  assert.match(client, /if \(event\.key !== 'Enter' \|\| event\.shiftKey\) return/)
+  assert.match(client, /event\.preventDefault\(\)\n\s+askAgent\(\)/)
+})
+
+check('a running turn can be stopped from the composer', () => {
+  assert.match(client, /askState\.status === 'sending' \|\| thread\.running/)
+  assert.match(client, /onClick: cancelTurn/)
+})
+
+check('answers render bold, inline code and bullets', () => {
+  assert.match(client, /const renderText = \(text\) => \{/)
+  assert.match(client, /message\.role === 'user' \? message\.text : renderText\(message\.text\)/)
+  assert.match(client, /h\('strong'/)
+  assert.match(client, /h\('code'/)
+})
+
+check('plain language search asks the host resolver', () => {
+  assert.match(client, /\$\{ROUTE\}\/search\?id=/)
+  assert.match(client, /colloquial\?\.understood/)
+  assert.match(client, /search\.understood/)
+})
+
 console.log('\nlocale parity')
 // A lookbehind keeps `x.get('etag')` from being read as a t() key — the
 // regex matched it and reported a missing translation for an HTTP header.

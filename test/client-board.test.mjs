@@ -550,7 +550,14 @@ await check('the Agent tab draws the transcript, below the input', async () => {
     }
     if (node.type === 'textarea') order.push('input')
     const own = node.props?.children
+    // Answers are rendered as elements now (bold/code/bullets), so the text can
+    // sit in a grandchild rather than in a direct string child.
     if (typeof own === 'string' && own.includes('VDDCR_GFX')) order.push('answer')
+    if (Array.isArray(own)) {
+      for (const child of own) {
+        if (typeof child === 'string' && child.includes('VDDCR_GFX')) order.push('answer')
+      }
+    }
     walk(own)
   }
   walk(tree)
@@ -591,6 +598,23 @@ await check('a blocked turn draws its options as buttons', async () => {
   askRoute.handler = realAsk
   assert.ok(sent, 'clicking an option sent nothing')
   threadFixture.pending = null
+})
+
+await check('a colloquial search returns real parts with a reason', async () => {
+  // The canvas search box, identified by its own placeholder: the panel has
+  // several inputs and the schematic query is not this one.
+  const box = findNode(tree, (node) => node.type === 'input' && node.props?.['aria-label'] === 'toolbar.search')
+  assert.ok(box, 'no search input in the panel')
+  box.props.onChange({ currentTarget: { value: 'cpu' } })
+  tree = await runtime.mount(panel({}))
+  // The resolver is debounced by 220 ms, so let it fire before looking.
+  await new Promise((resolve) => setTimeout(resolve, 280))
+  tree = await runtime.mount(panel({}))
+  const text = textOf(tree)
+  assert.match(text, /search.understood|cpu/i, 'the panel did not report what it understood')
+  // The largest package in the fixture is the processor candidate.
+  assert.match(text, /N15900/, 'no part came back for "cpu"')
+  assert.match(text, /largest pad count/, 'the reason for the match is not shown')
 })
 
 await check('an IC’s pins are numbered 1..N in the inspector', async () => {

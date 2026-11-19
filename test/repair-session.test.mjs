@@ -17,7 +17,7 @@ const libraryDir = path.join(os.tmpdir(), `wrenchbench-repair-${process.pid}`)
 process.env.DSH_WRENCHBENCH_DIR = libraryDir
 
 const store = await import('../store.js')
-const { createRepairThread, transcriptOf, isHarnessMessage, pendingQuestionOf } = await import('../repair-session.js')
+const { createRepairThread, transcriptOf, isHarnessMessage, pendingQuestionOf, wedgedOf } = await import('../repair-session.js')
 
 let passed = 0
 const failures = []
@@ -451,6 +451,193 @@ await checkAsync('the transcript reports the question the panel must draw', asyn
   assert.match(threadView.messages[0].text, /Rail first/)
   assert.equal(threadView.pending.question, '0 V or 3.3 V?')
   assert.deepEqual(threadView.pending.options, ['0 V', '3.3 V'])
+})
+
+await check('a clean thread is not called wedged', () => {
+  assert.equal(wedgedOf([]), null)
+  assert.equal(
+    wedgedOf([
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'step/start', data: { turn: 1, step: 1 } },
+      { seq: 3, type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } },
+      { seq: 4, type: 'step/end', data: { turn: 1, step: 1 } },
+      { seq: 5, type: 'turn/end', data: { turn: 1 } },
+    ]),
+    null,
+  )
+})
+
+await check('a turn that failed before a step is a swallowed prompt', () => {
+  // The real shape: the prompt is admitted, the runner opens a turn, and the turn
+  // dies before a step — here because the session log had been deleted under it —
+  // so nothing the technician typed is ever in the transcript and `running` is
+  // false the whole time.
+  const wedge = wedgedOf([
+    { seq: 5, type: 'turn/start', data: { turn: 1 } },
+    { seq: 7, type: 'step/start', data: { turn: 1, step: 1 } },
+    { seq: 20, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    { seq: 22, type: 'turn/start', data: { turn: 2 } },
+    { seq: 24, type: 'turn/end', data: { turn: 2, reason: { kind: 'error', error: { message: 'ENOENT: no such file or directory' } } } },
+    { seq: 26, type: 'turn/start', data: { turn: 3 } },
+    { seq: 28, type: 'turn/end', data: { turn: 3, reason: { kind: 'error', error: { message: 'ENOENT: no such file or directory' } } } },
+  ])
+  assert.equal(wedge.reason, 'failed-turn')
+  assert.equal(wedge.failedTurns, 2, 'both dead turns must be counted')
+  assert.match(wedge.failure, /ENOENT/)
+})
+
+await check('a cancelled turn is not a wedged thread', () => {
+  // Stop also leaves a turn with no step. Forking on that would carry the thread
+  // away every time the technician pressed Stop, which is the opposite of helping.
+  assert.equal(
+    wedgedOf([
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+    ]),
+    null,
+  )
+  // An interrupted assistant message with a completed turn is normal too.
+  assert.equal(
+    wedgedOf([
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'step/start', data: { turn: 1, step: 1 } },
+      { seq: 3, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Rail first.' }] } } },
+      { seq: 4, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    ]),
+    null,
+  )
+})
+
+await check('an open turn and a dangling call are both wedged', () => {
+  const openTurn = wedgedOf([
+    { seq: 1, type: 'turn/start', data: { turn: 1 } },
+    { seq: 2, type: 'step/start', data: { turn: 1, step: 1 } },
+  ])
+  assert.equal(openTurn.reason, 'open-turn')
+  assert.equal(openTurn.turn, 1)
+  // A turn that completed with an unanswered tool call is the narrow form.
+  const dangling = wedgedOf([
+    { seq: 1, type: 'turn/start', data: { turn: 1 } },
+    { seq: 2, type: 'step/start', data: { turn: 1, step: 1 } },
+    { seq: 3, type: 'tool/call', data: { turn: 1, callId: 'c1', name: 'ask_user_question' } },
+    { seq: 4, type: 'step/end', data: { turn: 1, step: 1 } },
+    { seq: 5, type: 'turn/end', data: { turn: 1 } },
+  ])
+  assert.equal(dangling.reason, 'dangling-call')
+  assert.deepEqual(dangling.danglingCalls, ['c1'])
+  // And a call that was answered clears it.
+  assert.equal(
+    wedgedOf([
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'step/start', data: { turn: 1, step: 1 } },
+      { seq: 3, type: 'tool/call', data: { turn: 1, callId: 'c1', name: 'ask_user_question' } },
+      { seq: 4, type: 'tool/result', data: { turn: 1, message: { toolCallId: 'c1' } } },
+      { seq: 5, type: 'turn/end', data: { turn: 1 } },
+    ]),
+    null,
+  )
+})
+
+await checkAsync('a swallowing thread is forked, keeping the transcript', async () => {
+  const forks = []
+  const prompted = []
+  let forked = false
+  const thread = createRepairThread({
+    ctx: {
+      get: () => ({
+        async create() {
+          return { sessionId: 'fresh-1' }
+        },
+        async rename() {
+          return {}
+        },
+        async inspect(id) {
+          if (id === 'dead-1') {
+            return {
+              events: [
+                { seq: 5, type: 'turn/start', data: { turn: 1 } },
+                { seq: 7, type: 'step/start', data: { turn: 1, step: 1 } },
+                { seq: 20, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+                { seq: 22, type: 'turn/start', data: { turn: 2 } },
+                { seq: 24, type: 'turn/end', data: { turn: 2, reason: { kind: 'error', error: { message: 'ENOENT: no such file or directory' } } } },
+              ],
+            }
+          }
+          return { events: [] }
+        },
+        async fork(request) {
+          forks.push(request)
+          forked = true
+          return { sessionId: 'fork-1' }
+        },
+        async list() {
+          // The whole point: nothing is running while the thread eats prompts.
+          return { items: [{ sessionId: 'dead-1', running: false }] }
+        },
+        async prompt(request) {
+          prompted.push(request)
+          return { accepted: true }
+        },
+      }),
+    },
+    root: store.dataRoot,
+    store,
+  })
+  store.writeRepairSession('fork-board', { sessionId: 'dead-1' })
+  const answer = await thread.ask('fork-board', 'Fork Board', 'is the rail there?')
+  assert.equal(answer.accepted, true)
+  assert.equal(forked, true, 'a swallowing thread was not forked')
+  assert.equal(forks.length, 1)
+  // Pinned to the last event, not left to the "latest completed turn" default: a
+  // wedged log may have no completed turn, and the default would drop the repair.
+  assert.equal(forks[0].atSeq, 24, 'the fork was not pinned to the last event')
+  assert.equal(answer.recovered, 'forked')
+  assert.equal(answer.sessionId, 'fork-1', 'the prompt did not go to the new thread')
+  assert.equal(prompted.length, 1)
+  assert.equal(prompted[0].sessionId, 'fork-1')
+  assert.equal(store.readRepairSession('fork-board')?.sessionId, 'fork-1', 'the fork was not remembered')
+})
+
+await checkAsync('a thread stuck on a question is replaced, not queued behind', async () => {  const made = []
+  const prompted = []
+  const stuck = createRepairThread({
+    ctx: {
+      get: () => ({
+        async create() {
+          made.push(`s${made.length + 1}`)
+          return { sessionId: `s${made.length}` }
+        },
+        async rename() {
+          return {}
+        },
+        async inspect(id) {
+          // s1 is wedged on a question; s2 is a clean thread.
+          if (id === 's1') {
+            return {
+              events: [
+                { type: 'tool/call', data: { name: 'ask_user_question', callId: 'c1', arguments: '{"questions":[{"question":"0 V or 3.3 V?","options":[{"label":"0 V"}]}]}' } },
+              ],
+            }
+          }
+          return { events: [] }
+        },
+        async list() {
+          return { items: [{ sessionId: 's1', running: false }] }
+        },
+        async prompt(request) {
+          prompted.push(request)
+          return { accepted: true }
+        },
+      }),
+    },
+    root: store.dataRoot,
+    store,
+  })
+  const answer = await stuck.ask('wedge-board', 'Wedge Board', 'next question')
+  assert.equal(answer.accepted, true)
+  assert.equal(made.length, 2, 'a wedged thread was not replaced')
+  assert.equal(answer.sessionId, 's2', 'the prompt went to the wedged session')
+  assert.equal(prompted.length, 1)
 })
 
 console.log('\nfailures are reported, never hidden')

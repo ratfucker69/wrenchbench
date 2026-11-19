@@ -1394,6 +1394,8 @@ function paintPartSymbol(context, box, family, style, onePx) {
           // one click away, and never in the way of the canvas.
           const [hintsOpen, setHintsOpen] = React.useState(false)
           const [search, setSearch] = React.useState('')
+          // What the host made of a plain-language query ("mosfet", "vcore").
+          const [colloquial, setColloquial] = React.useState(null)
           const [dragging, setDragging] = React.useState(false)
           const [selection, setSelection] = React.useState({ refdes: null, net: null, pin: null, annotation: null })
           const [schematic, setSchematic] = React.useState(null)
@@ -1422,7 +1424,7 @@ function paintPartSymbol(context, box, family, style, onePx) {
           const [askState, setAskState] = React.useState({ status: 'idle', message: '', sessionId: null })
           // The repair conversation lives in WrenchBench's own session, not in
           // the workspace list, so the panel draws it here.
-          const [thread, setThread] = React.useState({ messages: [], running: false, sessionId: null, unavailable: null })
+          const [thread, setThread] = React.useState({ messages: [], running: false, pending: null, wedged: false, sessionId: null, unavailable: null })
           const [ui, setUi] = React.useState({
             showComponents: true,
             showPads: true,
@@ -1913,6 +1915,9 @@ function paintPartSymbol(context, box, family, style, onePx) {
                 // rebuild of the thread state once dropped it, which made a
                 // wedged thread look like a panel that refused to show anything.
                 pending: body?.pending ?? null,
+                // A thread that eats prompts without running anything has to say
+                // so, because `running` is false in exactly that state.
+                wedged: body?.wedged === true,
                 sessionId: body?.sessionId ?? null,
                 unavailable: body?.unavailable ?? null,
               })
@@ -1974,7 +1979,13 @@ function paintPartSymbol(context, box, family, style, onePx) {
                 refdes: selection.refdes ?? undefined,
               })
               if (body?.accepted) {
-                setAskState({ status: 'sent', message: '', sessionId: body.sessionId ?? null })
+                // A recovered thread is worth one line: the answer is coming, but
+                // the conversation was carried forward rather than continued.
+                setAskState({
+                  status: 'sent',
+                  message: body.recovered ? t('agent.recovered') : '',
+                  sessionId: body.sessionId ?? null,
+                })
                 setAskText('')
                 // Draw the question immediately rather than after the next poll.
                 setThread((existing) => ({
@@ -1999,7 +2010,7 @@ function paintPartSymbol(context, box, family, style, onePx) {
             if (!activeId) return
             try {
               const body = await sendJson(`${ROUTE}/conversation/new?id=${encodeURIComponent(activeId)}`, 'POST', {})
-              setThread({ messages: [], running: false, sessionId: body?.sessionId ?? null, unavailable: null })
+              setThread({ messages: [], running: false, pending: null, wedged: false, sessionId: body?.sessionId ?? null, unavailable: null })
               setAskState({ status: 'idle', message: '', sessionId: null })
             } catch (error) {
               setAskState({ status: 'error', message: error instanceof Error ? error.message : String(error), sessionId: null })
@@ -2338,6 +2349,32 @@ function paintPartSymbol(context, box, family, style, onePx) {
               nets: board.nets.filter((net) => net.name.toLowerCase().includes(needle)).slice(0, 24),
             }
           }, [board, search])
+
+          // Plain language goes to the host, which owns the synonym table. The local
+          // filter above still answers labels instantly; this adds the words that
+          // are not in the file at all.
+          React.useEffect(() => {
+            const query = search.trim()
+            if (!boardId || query.length < 3) {
+              setColloquial(null)
+              return undefined
+            }
+            let cancelled = false
+            const timer = setTimeout(async () => {
+              try {
+                const body = await getJson(
+                  `${ROUTE}/search?id=${encodeURIComponent(boardId)}&q=${encodeURIComponent(query)}`,
+                )
+                if (!cancelled) setColloquial(body)
+              } catch {
+                if (!cancelled) setColloquial(null)
+              }
+            }, 220)
+            return () => {
+              cancelled = true
+              clearTimeout(timer)
+            }
+          }, [boardId, search])
 
           const inspectedPart = React.useMemo(() => {
             if (!board || !selection.refdes) return null
@@ -3032,8 +3069,15 @@ function paintPartSymbol(context, box, family, style, onePx) {
                             boxShadow: '0 6px 24px color-mix(in srgb, currentColor 20%, transparent)',
                           },
                         },
-                        matching.parts.length === 0 && matching.nets.length === 0
-                          ? h('div', { style: { fontSize: 12, color: T.muted, padding: 4 } }, t('schematic.noMatches'))
+                        matching.parts.length === 0 &&
+                        matching.nets.length === 0 &&
+                        (colloquial?.parts?.length ?? 0) === 0 &&
+                        (colloquial?.nets?.length ?? 0) === 0
+                          ? h(
+                              'div',
+                              { style: { fontSize: 12, color: T.muted, padding: 4, lineHeight: 1.45 } },
+                              (colloquial?.notes ?? []).length > 0 ? colloquial.notes[0] : t('schematic.noMatches'),
+                            )
                           : null,
                         matching.parts.map((part) =>
                           h(
@@ -3097,6 +3141,82 @@ function paintPartSymbol(context, box, family, style, onePx) {
                             h('span', { style: { fontSize: 10.5, color: T.muted } }, `${net.pins.length} ${t('inspector.pins')}`),
                           ),
                         ),
+                        // What the host understood, when the words are not in the
+                        // file: "mosfet", "cpu", "vcore". Each hit carries the
+                        // reason it was matched, so nothing is asserted silently.
+                        colloquial?.understood &&
+                        ((colloquial.parts ?? []).length > 0 || (colloquial.nets ?? []).length > 0)
+                          ? h(
+                              'div',
+                              { style: { borderTop: T.border, marginTop: 4, paddingTop: 4 } },
+                              h(
+                                'div',
+                                { style: { fontSize: 9.5, color: T.muted, letterSpacing: 0.4, textTransform: 'uppercase', padding: '2px 6px' } },
+                                `${t('search.understood')}: ${(colloquial.roles ?? []).join(', ') || search.trim()}`,
+                              ),
+                              (colloquial.nets ?? []).map((hit) =>
+                                h(
+                                  'button',
+                                  {
+                                    key: `cn-${hit.net}`,
+                                    type: 'button',
+                                    title: hit.reason,
+                                    onClick: () => {
+                                      setSelection({ refdes: null, net: hit.net, pin: null, annotation: null })
+                                      setSearch('')
+                                    },
+                                    style: {
+                                      display: 'flex',
+                                      width: '100%',
+                                      gap: 8,
+                                      alignItems: 'baseline',
+                                      appearance: 'none',
+                                      border: 'none',
+                                      background: 'transparent',
+                                      color: 'inherit',
+                                      cursor: 'pointer',
+                                      padding: '3px 6px',
+                                      borderRadius: 6,
+                                      fontSize: 12,
+                                      textAlign: 'left',
+                                      fontFamily: 'inherit',
+                                    },
+                                  },
+                                  h('span', { style: { fontFamily: T.mono } }, hit.net),
+                                  h('span', { style: { fontSize: 10.5, color: T.muted, flex: 1 } }, hit.reason),
+                                ),
+                              ),
+                              (colloquial.parts ?? []).map((hit) =>
+                                h(
+                                  'button',
+                                  {
+                                    key: `cp-${hit.refdes}`,
+                                    type: 'button',
+                                    title: hit.reason,
+                                    onClick: () => zoomToPart(hit.refdes),
+                                    style: {
+                                      display: 'flex',
+                                      width: '100%',
+                                      gap: 8,
+                                      alignItems: 'baseline',
+                                      appearance: 'none',
+                                      border: 'none',
+                                      background: 'transparent',
+                                      color: 'inherit',
+                                      cursor: 'pointer',
+                                      padding: '3px 6px',
+                                      borderRadius: 6,
+                                      fontSize: 12,
+                                      textAlign: 'left',
+                                      fontFamily: 'inherit',
+                                    },
+                                  },
+                                  h('span', { style: { fontFamily: T.mono } }, aliases[hit.refdes]?.alias ?? hit.refdes),
+                                  h('span', { style: { fontSize: 10.5, color: T.muted, flex: 1 } }, hit.reason),
+                                ),
+                              ),
+                            )
+                          : null,
                       )
                     : null,
                   ui.railColour && rails.length > 0
@@ -3985,6 +4105,51 @@ function paintPartSymbol(context, box, family, style, onePx) {
             }
           }, [boardId, loadThread, setNotice, t])
 
+          // Answers arrive as light markdown. Rendering bold, inline code and bullets
+          // makes a diagnosis readable at the bench; anything cleverer would need
+          // a parser and a sanitiser this panel does not want.
+          const renderText = (text) => {
+            const lines = String(text ?? '').split('\n')
+            return lines.map((line, index) => {
+              const bullet = /^\s*[-*•]\s+/.test(line)
+              const body = bullet ? line.replace(/^\s*[-*•]\s+/, '') : line
+              const pieces = []
+              const pattern = /\*\*([^*]+)\*\*|`([^`]+)`/g
+              let last = 0
+              let match
+              while ((match = pattern.exec(body)) !== null) {
+                if (match.index > last) pieces.push(body.slice(last, match.index))
+                if (match[1]) pieces.push(h('strong', { key: `b${index}-${match.index}` }, match[1]))
+                else pieces.push(h('code', { key: `c${index}-${match.index}`, style: { fontFamily: T.mono, fontSize: 11 } }, match[2]))
+                last = pattern.lastIndex
+              }
+              if (last < body.length) pieces.push(body.slice(last))
+              return h(
+                'div',
+                {
+                  key: `line-${index}`,
+                  style: {
+                    display: 'block',
+                    paddingLeft: bullet ? 10 : 0,
+                    textIndent: bullet ? -8 : 0,
+                    minHeight: line.length === 0 ? 6 : undefined,
+                  },
+                },
+                bullet ? '• ' : null,
+                ...pieces,
+              )
+            })
+          }
+
+          const copyAnswer = async (text) => {
+            try {
+              await navigator.clipboard.writeText(String(text ?? ''))
+              setNotice(t('agent.copied'))
+            } catch {
+              setNotice(t('agent.copyFailed'))
+            }
+          }
+
           const agentPane = h(
             'div',
             { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, flex: 1 } },
@@ -4012,6 +4177,13 @@ function paintPartSymbol(context, box, family, style, onePx) {
             h('textarea', {
               value: askText,
               onChange: (event) => setAskText(event.currentTarget.value),
+              // Enter sends, Shift+Enter is a newline: the same contract as the
+              // harness chat box this panel sits beside.
+              onKeyDown: (event) => {
+                if (event.key !== 'Enter' || event.shiftKey) return
+                event.preventDefault()
+                askAgent()
+              },
               placeholder: t('agent.placeholder'),
               rows: 3,
               style: {
@@ -4048,12 +4220,24 @@ function paintPartSymbol(context, box, family, style, onePx) {
                 },
                 askState.status === 'sending' ? t('agent.sending') : t('agent.send'),
               ),
+              askState.status === 'sending' || thread.running
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      onClick: cancelTurn,
+                      title: t('agent.cancelTurn'),
+                      style: { ...BUTTON, padding: '6px 12px', fontWeight: 600, color: T.danger },
+                    },
+                    t('agent.stop'),
+                  )
+                : null,
               selection.refdes
                 ? h('span', { style: { fontSize: 11, color: T.muted, fontFamily: T.mono } }, `→ ${selection.refdes}`)
                 : null,
             ),
             askState.status === 'sent'
-              ? h('div', { style: { fontSize: 11, color: T.muted } }, t('agent.sent'))
+              ? h('div', { style: { fontSize: 11, color: T.muted } }, askState.message || t('agent.sent'))
               : null,
             askState.status === 'no-session'
               ? h('div', { style: { fontSize: 12, color: T.muted } }, t('agent.noSession'))
@@ -4109,6 +4293,12 @@ function paintPartSymbol(context, box, family, style, onePx) {
                   ),
                 )
               : null,
+            // A thread that stopped swallowing answers reports itself as idle, so
+            // nothing else here would say so — and the technician would type into a
+            // box that appears to do nothing.
+            thread.wedged && !thread.pending
+              ? h('div', { style: { fontSize: 11, color: T.muted, lineHeight: 1.5 } }, t('agent.wedged'))
+              : null,
             // The conversation is WrenchBench's own session, drawn here so the
             // technician never sees a workspace chat for a bench question.
             h(
@@ -4162,9 +4352,10 @@ function paintPartSymbol(context, box, family, style, onePx) {
                                     paddingLeft: 7,
                                     borderLeft: `2px solid ${T.brand}`,
                                     whiteSpace: 'pre-wrap',
+                                    position: 'relative',
                                   },
                           },
-                          message.text,
+                          message.role === 'user' ? message.text : renderText(message.text),
                         ),
                   ),
               thread.running
