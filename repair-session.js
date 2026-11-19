@@ -375,11 +375,11 @@ export function createRepairThread({ ctx, root, store }) {
     // Forking past it keeps the transcript and lets the harness synthesise the
     // closers; without a fork service the thread is replaced instead, which loses
     // the history but not the bench.
-    const events = await inspectEvents(service, thread.sessionId)
-    const wedge = wedgedOf(events)
+    const log = await inspectEvents(service, thread.sessionId)
+    const wedge = wedgedOf(freshEvents(log))
     let recovery = null
     if (wedge) {
-      const forked = await forkThread(service, thread.sessionId, events)
+      const forked = await forkThread(service, thread.sessionId, log.events)
       if (forked) {
         thread.sessionId = forked
         saveId(boardId, forked, { name: boardName ?? null, at: new Date().toISOString() })
@@ -424,19 +424,30 @@ export function createRepairThread({ ctx, root, store }) {
   }
 
   /**
-   * The session log, or an empty list when it cannot be read.
+   * The session log and how much of its front is inherited, or an empty log.
    *
    * Every decision below is made from events rather than from `running`: the state
-   * that swallows prompts reports itself as idle.
+   * that swallows prompts reports itself as idle. The inherited count matters
+   * because a fork copies the history it was forked from — including the dead
+   * turns that caused the fork — and re-detecting those would mark a healthy
+   * thread as broken for ever.
    */
   async function inspectEvents(service, sessionId) {
-    if (typeof service.inspect !== 'function') return []
+    if (typeof service.inspect !== 'function') return { events: [], inherited: 0 }
     try {
       const inspected = await service.inspect(sessionId)
-      return Array.isArray(inspected?.events) ? inspected.events : []
+      const events = Array.isArray(inspected?.events) ? inspected.events : []
+      const inherited = Number(inspected?.inheritedEventCount) > 0 ? Number(inspected.inheritedEventCount) : 0
+      return { events, inherited }
     } catch {
-      return []
+      return { events: [], inherited: 0 }
     }
+  }
+
+  /** Only what this session wrote itself, without the history it inherited. */
+  function freshEvents(log) {
+    if (!log.inherited) return log.events
+    return log.events.filter((event) => Number(event?.seq ?? 0) >= log.inherited)
   }
 
   /**
@@ -537,19 +548,18 @@ export function createRepairThread({ ctx, root, store }) {
     let running = false
     let pending = null
     let wedge = null
-    if (typeof service.inspect === 'function') {
-      try {
-        const inspected = await service.inspect(thread.sessionId)
-        messages = transcriptOf(inspected?.events)
-        // A turn waiting on an unanswerable question is the one state the panel
-        // must draw differently: it needs the options, not a spinner.
-        pending = pendingQuestionOf(inspected?.events)
-        // A dead-but-unclosed turn is the other: nothing is running, and yet the
-        // next question would vanish, so the panel has to say so.
-        wedge = wedgedOf(inspected?.events)
-      } catch {
-        // A session that has not been written yet is simply empty.
-      }
+    const log = await inspectEvents(service, thread.sessionId)
+    if (log.events.length > 0) {
+      // The transcript draws the whole log, inherited history included — the
+      // technician carried it forward and expects to keep reading it.
+      messages = transcriptOf(log.events)
+      // The two states the panel must draw differently are read from this
+      // session's own events only. A dead turn that was inherited is history:
+      // it is what caused the fork, and re-reading it would mark a healthy
+      // thread broken for ever.
+      const fresh = freshEvents(log)
+      pending = pendingQuestionOf(fresh)
+      wedge = wedgedOf(fresh)
     }
     if (typeof service.list === 'function') {
       try {

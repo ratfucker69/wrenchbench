@@ -598,6 +598,49 @@ await checkAsync('a swallowing thread is forked, keeping the transcript', async 
   assert.equal(store.readRepairSession('fork-board')?.sessionId, 'fork-1', 'the fork was not remembered')
 })
 
+await checkAsync('inherited dead turns do not mark a forked thread broken', async () => {
+  // A fork copies the history it was forked from, dead turns included. Reading
+  // those again would peg the panel on "this thread is stuck" for ever, on a
+  // thread that answers perfectly well.
+  const forked = createRepairThread({
+    ctx: {
+      get: () => ({
+        async create() {
+          return { sessionId: 'f-1' }
+        },
+        async inspect() {
+          return {
+            // 0..11 are the inherited history, 12+ are this session's own.
+            inheritedEventCount: 12,
+            events: [
+              { seq: 1, type: 'turn/start', data: { turn: 1 } },
+              { seq: 2, type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: { message: 'ENOENT' } } } },
+              { seq: 3, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Phase 6 is leaky.' }] } } },
+              { seq: 12, type: 'turn/start', data: { turn: 7 } },
+              { seq: 13, type: 'step/start', data: { turn: 7, step: 1 } },
+              { seq: 14, type: 'user/message', data: { content: [{ type: 'text', text: 'next' }] } },
+              { seq: 15, type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } },
+            ],
+          }
+        },
+        async list() {
+          return { items: [{ sessionId: 'f-1', running: false }] }
+        },
+        async prompt() {
+          return { accepted: true }
+        },
+      }),
+    },
+    root: store.dataRoot,
+    store,
+  })
+  store.writeRepairSession('inherited-board', { sessionId: 'f-1' })
+  const view = await forked.conversation('inherited-board', 'Inherited Board')
+  assert.equal(view.wedged, false, 'inherited history was re-read as a live fault')
+  // The inherited transcript is still drawn: that is the point of the fork.
+  assert.equal(view.messages.some((m) => /Phase 6 is leaky/.test(m.text)), true, 'the inherited answer was dropped')
+})
+
 await checkAsync('a thread stuck on a question is replaced, not queued behind', async () => {  const made = []
   const prompted = []
   const stuck = createRepairThread({
